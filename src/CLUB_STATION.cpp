@@ -2734,10 +2734,9 @@ void drawWiFiIndicator()
 void drawMQTTIndicator()
 {
     int16_t w = tft.width();
-    int16_t h = tft.height();
 
     int16_t cx = w - 20; // bottom-right corner
-    int16_t cy = h - 10;
+    int16_t cy = KEYPAD_NAV_Y + (KEYPAD_NAV_H / 2);
     uint8_t r = 6;
 
     // -------------------------------------------------
