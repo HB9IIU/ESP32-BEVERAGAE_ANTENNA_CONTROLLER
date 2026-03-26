@@ -1,0 +1,1001 @@
+// ============================================================================
+//  CLUB_SWITCH  -  ESP32 CYD Polar Antenna Selector (Club side, "boss")
+//  - Local KY-040 encoder + push button
+//  - TFT shows polar map + antenna dots
+//  - Publishes state to MQTT topic "antenna/state" (retained)
+//  - Listens for commands on "antenna/cmd" from remote panels (e.g. Henryk)
+//
+//  LOCAL BEHAVIOUR (CLUB):
+//    - Every encoder detent immediately changes the SELECTED antenna
+//      and publishes the new state:
+//        {"selected":N,"pre":N,"source":"CLUB_SWITCH","reason":"select_local"}
+//    - The button is optional: on press, it simply re-broadcasts the current
+//      state with reason "select_button" (no change in selection).
+//
+//  REMOTE COMMANDS (from antenna/cmd):
+//    - {"select":N,...}  -> commit selection at the club, publish state
+//                          with reason "select_remote".
+//    - {"pre":N,...}     -> only move the red PRE dot, do NOT change selected.
+//                          No state publish to avoid echo loops.
+//
+//  HEARTBEAT (CLUB -> broker):
+//    - Every 5 seconds, CLUB_SWITCH sends a heartbeat on "antenna/heartbeat":
+//        {"source":"CLUB_SWITCH","reason":"heartbeat"}
+//
+//  MQTT STATUS LED ON TFT (NEW):
+//    - Small dot above "CLUB 1.0" text at bottom-right.
+//    - Blinks slowly.
+//    - GREEN when MQTT is connected, RED when not connected.
+//
+//  Daniel / HB9IIU
+// ============================================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+#include <SPI.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <PNGdec.h>
+
+// -----------------------------------------------------------------------------
+//                               PIN DEFINITIONS
+// -----------------------------------------------------------------------------
+
+// Touchscreen pins (CYD)
+#define XPT2046_IRQ  36  // T_IRQ
+#define XPT2046_MOSI 32  // T_DIN
+#define XPT2046_MISO 39  // T_OUT
+#define XPT2046_CLK  25  // T_CLK
+#define XPT2046_CS   33  // T_CS
+
+// Encoder pins (KY-040)
+#define PIN_ENC_DT   35  // DT
+#define PIN_ENC_CLK  27  // CLK
+#define PIN_ENC_SW   22  // Switch (push button)
+
+// -----------------------------------------------------------------------------
+//                         WIFI / MQTT CONFIG
+// -----------------------------------------------------------------------------
+
+const char *WIFI_SSID  = "MESH";
+const char *WIFI_PASS  = "Nestle2010Nestle";
+
+// HiveMQ Cloud cluster
+const char   *MQTT_HOST   = "1db5ec5c4ff44e67bcb25a811f852e53.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT  = 8883;
+const char   *MQTT_USER   = "esp32-club";
+const char   *MQTT_PASSWD = "@V51bP9J@H";
+
+// Topics
+const char *MQTT_TOPIC_STATE     = "antenna/state";     // club publishes (retained)
+const char *MQTT_TOPIC_CMD       = "antenna/cmd";       // club listens
+const char *MQTT_TOPIC_HEARTBEAT = "antenna/heartbeat"; // club heartbeat
+
+WiFiClientSecure mqttSecureClient;
+PubSubClient     mqttClient(mqttSecureClient);
+
+// -----------------------------------------------------------------------------
+//                         GLOBAL OBJECTS / CONFIG CONSTANTS
+// -----------------------------------------------------------------------------
+
+// Touchscreen SPI and object
+SPIClass touchscreenSPI = SPIClass(VSPI);
+XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
+
+// TFT display object
+TFT_eSPI tft = TFT_eSPI();
+
+// PNG decoder
+PNG png;
+fs::File pngFile;  // used by PNGdec callbacks
+
+// Images in SPIFFS
+String startupLogo   = "logo.png";
+String backgroundMap = "greatcircle1.png";
+
+// Dial geometry
+const int16_t DIAL_RING_RADIUS = 112; // distance from center to small-circle centers
+const int16_t DIAL_DOT_RADIUS  = 7;   // radius of each small circle
+
+// Maximum supported antenna dots
+const uint8_t MAX_DOTS = 16;
+
+// Actual number of active dots
+uint8_t numDots = 11; // will be set in loadDotConfig()
+
+// Azimuth configuration for each dot, in degrees from North (0° = North, 90° = East)
+float dotAzimuthDeg[MAX_DOTS + 1]; // index 1..numDots
+
+// Precomputed screen positions for each dot
+int16_t dotX[MAX_DOTS + 1];
+int16_t dotY[MAX_DOTS + 1];
+
+// Colors for antenna states
+uint16_t TftGrey;
+uint16_t TftRed;
+uint16_t TftYellow;
+uint16_t TftGreen;
+
+// Antenna selection state
+uint8_t selectedAntenna    = 1; // The actually active antenna (GREEN)
+uint8_t preSelectedAntenna = 1; // Antenna under "cursor" (RED if != selected)
+const  uint8_t ANTENNA_MIN = 1;
+       uint8_t ANTENNA_MAX = 11; // kept in sync with numDots
+
+// --------------------- Encoder quadrature decoding state ---------------------
+
+int8_t  encoderAccum = 0; // accumulates micro-steps
+uint8_t lastState    = 0; // last 2-bit encoder state
+
+// How many quadrature micro steps per detent (KY-040 typical = 4)
+const int STEPS_PER_NOTCH = 4;
+
+// Quadrature lookup table (prev_state << 2 | current_state) -> -1,0,+1
+const int8_t encTable[16] = {
+    0, +1, -1, 0,
+    -1, 0, 0, +1,
+    +1, 0, 0, -1,
+    0, -1, +1, 0};
+
+// -------------------------- Button debounce state ---------------------------
+
+unsigned long lastDebounceTime      = 0;
+const unsigned long debounceDelayMs = 50; // ms
+
+// ---------------------------- Heartbeat timing -------------------------------
+
+// CLUB heartbeat every 5 seconds (only if MQTT is connected)
+unsigned long lastHeartbeatMs             = 0;
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000;
+
+// --------------------------- MQTT status LED (TFT) --------------------------
+
+// Small dot above "CLUB 1.0" (bottom-right).
+bool          mqttLedOn            = false;
+unsigned long lastMqttLedToggleMs  = 0;
+const unsigned long MQTT_LED_BLINK_MS = 1000; // 1s on/off
+const int16_t MQTT_LED_RADIUS      = 5;
+
+// -----------------------------------------------------------------------------
+//                            FUNCTION PROTOTYPES
+// -----------------------------------------------------------------------------
+
+// WiFi / MQTT
+void connectWiFi();
+void mqttSetup();
+bool mqttEnsureConnected();
+void mqttCallback(char *topic, byte *payload, unsigned int length);
+void publishAntennaState(const char *reason, const char *source);
+void publishHeartbeat(); // heartbeat
+
+// System init helpers
+void initTouchAndTft();
+void initFilesystemAndBackground();
+void initAntennaDial();
+void initEncoder();
+
+// Antenna dial helpers
+void loadDotConfig();
+void updateAllDotPositions();
+void setDotAzimuth(uint8_t index, float azimuthDeg);
+void drawAntennaDot(uint8_t index, uint16_t color);
+void drawDialBase();
+void updateDialColors();
+
+// Encoder + button logic
+void updateEncoder();
+void updateButton();
+
+// SPIFFS helper
+void mountAndListSPIFFS(uint8_t levels = 255, bool listContent = true);
+
+// PNGdec callbacks and drawing
+void *fileOpen(const char *filename, int32_t *size);
+void fileClose(void *handle);
+int32_t fileRead(PNGFILE *handle, uint8_t *buffer, int32_t length);
+int32_t fileSeek(PNGFILE *handle, int32_t position);
+void pngDrawCallback(PNGDRAW *pDraw);
+void displayPNGfromSPIFFS(const char *filename, int duration_ms);
+
+// Corner text + MQTT LED helpers
+void drawStaticCornerLabels();
+void updateDynamicCornerLabels();
+void drawMqttStatusDot(bool forceRedraw = false);
+
+// -----------------------------------------------------------------------------
+//                                   SETUP
+// -----------------------------------------------------------------------------
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println(F("=== CLUB_SWITCH - Polar Antenna Selector (CLUB SIDE) ==="));
+
+  connectWiFi();
+  mqttSetup();
+
+  initTouchAndTft();
+  initFilesystemAndBackground();
+  initAntennaDial();
+  initEncoder();
+
+  // Initialize MQTT LED timing and draw once
+  lastMqttLedToggleMs = millis();
+  mqttLedOn = true;
+  drawMqttStatusDot(true);
+
+  Serial.println(F("Setup complete.\n"));
+}
+
+// -----------------------------------------------------------------------------
+//                                    LOOP
+// -----------------------------------------------------------------------------
+
+void loop()
+{
+  // Local control at club:
+  // - Encoder: immediate selection on every detent
+  // - Button : optional re-broadcast of current state
+  updateEncoder();
+  updateButton();
+
+  // Optional: touchscreen debugging
+  if (touchscreen.touched())
+  {
+    TS_Point p = touchscreen.getPoint();
+    Serial.print("TOUCH X="); Serial.print(p.x);
+    Serial.print(" Y=");      Serial.print(p.y);
+    Serial.print(" Z=");      Serial.println(p.z);
+  }
+
+  // Keep MQTT alive
+  mqttEnsureConnected();
+  mqttClient.loop();
+
+  unsigned long now = millis();
+
+  // --- Periodic heartbeat from CLUB_SWITCH ---
+  if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)
+  {
+    lastHeartbeatMs = now;
+    publishHeartbeat();
+  }
+
+  // --- Blink MQTT status LED on TFT ---
+  if (now - lastMqttLedToggleMs >= MQTT_LED_BLINK_MS)
+  {
+    lastMqttLedToggleMs = now;
+    mqttLedOn = !mqttLedOn;
+    drawMqttStatusDot(false);
+  }
+
+  delay(1); // small delay is fine
+}
+
+// ============================================================================
+//                            WIFI / MQTT HELPERS
+// ============================================================================
+
+void connectWiFi()
+{
+  Serial.println(F("[WIFI] Connecting to WiFi..."));
+  Serial.print(F("[WIFI] SSID: "));
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start           = millis();
+  const unsigned long timeoutMs = 20000;
+
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs)
+  {
+    delay(500);
+    Serial.print('.');
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println();
+    Serial.println(F("[WIFI] Connected!"));
+    Serial.print(F("[WIFI] IP address: "));
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println();
+    Serial.println(F("[WIFI] FAILED to connect within timeout."));
+  }
+}
+
+void mqttSetup()
+{
+  Serial.println(F("[MQTT] Setting up secure client (CLUB_SWITCH)..."));
+
+  mqttSecureClient.setInsecure();     // for HiveMQ Cloud quick start
+  mqttSecureClient.setTimeout(15000); // ms
+
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  mqttEnsureConnected();
+}
+
+bool mqttEnsureConnected()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  if (mqttClient.connected())
+    return true;
+
+  Serial.println(F("[MQTT] (Re)connecting to broker..."));
+
+  String clientId = String("cyd-club-") + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWD))
+  {
+    Serial.println(F("[MQTT] Connected to HiveMQ Cloud (CLUB_SWITCH)."));
+
+    // Subscribe to commands from remotes
+    if (mqttClient.subscribe(MQTT_TOPIC_CMD))
+    {
+      Serial.print(F("[MQTT] Subscribed to "));
+      Serial.println(MQTT_TOPIC_CMD);
+    }
+    else
+    {
+      Serial.println(F("[MQTT] Failed to subscribe to antenna/cmd"));
+    }
+
+    return true;
+  }
+  else
+  {
+    Serial.print(F("[MQTT] Connection FAILED, rc="));
+    Serial.println(mqttClient.state());
+    return false;
+  }
+}
+
+// Called when a message comes in on a subscribed topic
+void mqttCallback(char *topic, byte *payload, unsigned int length)
+{
+  Serial.print(F("[MQTT] Incoming topic: "));
+  Serial.println(topic);
+
+  // We only care about antenna/cmd here
+  if (strcmp(topic, MQTT_TOPIC_CMD) != 0)
+  {
+    Serial.println(F("[MQTT] Not antenna/cmd, ignoring."));
+    return;
+  }
+
+  // Make a null-terminated copy of the payload
+  char buf[160];
+  if (length >= sizeof(buf)) length = sizeof(buf) - 1;
+  memcpy(buf, payload, length);
+  buf[length] = '\0';
+
+  Serial.print(F("[MQTT] CMD received: "));
+  Serial.println(buf);
+
+  // -------- 1) Try SELECT command: {"select":N,...} --------
+  int sel = 0;
+  if (sscanf(buf, "{\"select\":%d", &sel) == 1)
+  {
+    Serial.print(F("[MQTT] Parsed SELECT = "));
+    Serial.println(sel);
+
+    if (sel < ANTENNA_MIN || sel > ANTENNA_MAX)
+    {
+      Serial.println(F("[MQTT] SELECT out of range, ignored."));
+      return;
+    }
+
+    preSelectedAntenna = (uint8_t)sel;
+    selectedAntenna    = (uint8_t)sel;
+
+    Serial.print(F("[CMD] Remote requested SELECT "));
+    Serial.println(selectedAntenna);
+
+    updateDialColors();
+    updateDynamicCornerLabels();
+
+    // Broadcast new official state so all remotes sync
+    publishAntennaState("select_remote", "CLUB_SWITCH");
+    return;
+  }
+
+  // -------- 2) Try PRE command: {"pre\":%d", &pre) == 1)
+  int pre = 0;
+  if (sscanf(buf, "{\"pre\":%d", &pre) == 1)
+  {
+    Serial.print(F("[MQTT] Parsed PRE = "));
+    Serial.println(pre);
+
+    if (pre < ANTENNA_MIN || pre > ANTENNA_MAX)
+    {
+      Serial.println(F("[MQTT] PRE out of range, ignored."));
+      return;
+    }
+
+    // Only move the pre-selection (red dot), keep selectedAntenna as-is
+    preSelectedAntenna = (uint8_t)pre;
+
+    Serial.print(F("[CMD] Remote PRE-select "));
+    Serial.print(preSelectedAntenna);
+    Serial.print(F(" (SELECTED still "));
+    Serial.print(selectedAntenna);
+    Serial.println(F(")"));
+
+    updateDialColors();
+    updateDynamicCornerLabels();
+
+    // No publishAntennaState() here to avoid echo/flicker on remotes
+    return;
+  }
+
+  // -------- 3) If neither SELECT nor PRE matched --------
+  Serial.println(F("[MQTT] No SELECT or PRE field found, ignored."));
+}
+
+// Publish current antenna state to MQTT topic "antenna/state"
+//
+// Sent as a *retained* MQTT message so new subscribers immediately receive the
+// last known state.
+void publishAntennaState(const char *reason, const char *source)
+{
+  if (!mqttEnsureConnected())
+  {
+    Serial.println(F("[MQTT] Cannot publish state (no connection)."));
+    return;
+  }
+
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"selected\":%u,\"pre\":%u,\"source\":\"%s\",\"reason\":\"%s\"}",
+           selectedAntenna, preSelectedAntenna, source, reason);
+
+  // 'true' = retained message so new subscribers get this state immediately
+  if (mqttClient.publish(MQTT_TOPIC_STATE, payload, true))
+  {
+    Serial.print(F("[MQTT] State -> "));
+    Serial.print(MQTT_TOPIC_STATE);
+    Serial.print(F(" : "));
+    Serial.println(payload);
+  }
+  else
+  {
+    Serial.println(F("[MQTT] Failed to publish antenna state"));
+  }
+}
+
+// Publish a simple heartbeat (non-retained) so remotes know CLUB is alive
+void publishHeartbeat()
+{
+  if (!mqttEnsureConnected())
+  {
+    // If not connected, do nothing; next loop will retry
+    return;
+  }
+
+  char payload[96];
+  snprintf(payload, sizeof(payload),
+           "{\"source\":\"%s\",\"reason\":\"heartbeat\"}",
+           "CLUB_SWITCH");
+
+  bool ok = mqttClient.publish(MQTT_TOPIC_HEARTBEAT, payload, false); // non-retained
+  if (ok)
+  {
+    Serial.print(F("[MQTT] Heartbeat -> "));
+    Serial.print(MQTT_TOPIC_HEARTBEAT);
+    Serial.print(F(" : "));
+    Serial.println(payload);
+  }
+  else
+  {
+    Serial.println(F("[MQTT] Failed to publish heartbeat"));
+  }
+}
+
+// ============================================================================
+//                            SYSTEM INIT HELPERS
+// ============================================================================
+
+void initTouchAndTft()
+{
+  Serial.println(F("[INIT] Touchscreen + TFT"));
+
+  // Touchscreen SPI
+  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  touchscreen.begin(touchscreenSPI);
+
+  // TFT
+  tft.init();
+  tft.setRotation(1);  // Landscape
+  tft.fillScreen(TFT_BLACK);
+
+  // Colors for antenna markers
+  TftGrey   = tft.color565(160, 160, 160);
+  TftRed    = TFT_RED;
+  TftYellow = TFT_YELLOW;
+  TftGreen  = TFT_GREEN;
+}
+
+// Mount SPIFFS, list content, draw background PNG
+void initFilesystemAndBackground()
+{
+  Serial.println(F("[INIT] SPIFFS + background PNG"));
+
+  mountAndListSPIFFS();
+
+  // Show startup logo
+  displayPNGfromSPIFFS(startupLogo.c_str(), 0);
+  delay(2000);
+
+  // Show polar / great-circle background
+  displayPNGfromSPIFFS(backgroundMap.c_str(), 0);
+}
+
+// Configure antenna azimuths, compute positions, draw base dial
+void initAntennaDial()
+{
+  Serial.println(F("[INIT] Antenna dial"));
+
+  loadDotConfig();       // set numDots and each dotAzimuthDeg[i]
+  ANTENNA_MAX = numDots; // keep selection bounds consistent
+
+  updateAllDotPositions(); // compute dotX/dotY for each azimuth
+  drawDialBase();          // draw all dots in grey
+
+  // Initial state: both selected and pre-selected = 1
+  selectedAntenna    = 1;
+  preSelectedAntenna = 1;
+  updateDialColors(); // color dots according to selection states
+
+  // Draw corner labels
+  drawStaticCornerLabels();    // bottom labels (once)
+  updateDynamicCornerLabels(); // top labels (dynamic, initial state)
+
+  // Announce startup state
+  publishAntennaState("startup", "CLUB_SWITCH");
+}
+
+// Initialize encoder GPIO
+void initEncoder()
+{
+  Serial.println(F("[INIT] Encoder "));
+
+  // Encoder pins
+  pinMode(PIN_ENC_DT,  INPUT);
+  pinMode(PIN_ENC_CLK, INPUT);
+
+  // Button (active LOW with internal pull-up)
+  pinMode(PIN_ENC_SW, INPUT_PULLUP);
+
+  // Initialize quadrature lastState
+  int dt  = digitalRead(PIN_ENC_DT);
+  int clk = digitalRead(PIN_ENC_CLK);
+  lastState = (dt << 1) | clk;
+}
+
+// ============================================================================
+//                             ANTENNA DIAL HELPERS
+// ============================================================================
+
+void loadDotConfig()
+{
+  /*
+    1. 0 deg
+    2. 20
+    3. 45 (phased)
+    4. 60
+    5. 90
+    6. 135
+    7. 180
+    8. 225
+    9. 275 (phased)
+   10. 310 (phased)
+   11. 330
+  */
+
+  numDots = 11; // we are using 11 antennas in this configuration
+
+  dotAzimuthDeg[1]  = 0.0f;
+  dotAzimuthDeg[2]  = 20.0f;
+  dotAzimuthDeg[3]  = 45.0f;
+  dotAzimuthDeg[4]  = 60.0f;
+  dotAzimuthDeg[5]  = 90.0f;
+  dotAzimuthDeg[6]  = 135.0f;
+  dotAzimuthDeg[7]  = 180.0f;
+  dotAzimuthDeg[8]  = 225.0f;
+  dotAzimuthDeg[9]  = 275.0f;
+  dotAzimuthDeg[10] = 310.0f;
+  dotAzimuthDeg[11] = 330.0f;
+}
+
+// Compute dotX/dotY on the TFT for all defined antennas
+void updateAllDotPositions()
+{
+  int16_t cx = tft.width() / 2;
+  int16_t cy = tft.height() / 2;
+
+  for (uint8_t i = 1; i <= numDots; i++)
+  {
+    float rad = dotAzimuthDeg[i] * PI / 180.0f; // deg -> rad
+
+    // 0° = North -> (cx, cy - R)
+    // Positive angles rotate clockwise
+    dotX[i] = cx + (int16_t)round(DIAL_RING_RADIUS * sin(rad));
+    dotY[i] = cy - (int16_t)round(DIAL_RING_RADIUS * cos(rad));
+  }
+}
+
+// Change a single antenna azimuth and recompute its screen position
+void setDotAzimuth(uint8_t index, float azimuthDeg)
+{
+  if (index < 1 || index > numDots)
+    return;
+
+  dotAzimuthDeg[index] = azimuthDeg;
+
+  int16_t cx = tft.width() / 2;
+  int16_t cy = tft.height() / 2;
+  float rad = azimuthDeg * PI / 180.0f;
+
+  dotX[index] = cx + (int16_t)round(DIAL_RING_RADIUS * sin(rad));
+  dotY[index] = cy - (int16_t)round(DIAL_RING_RADIUS * cos(rad));
+}
+
+// Draw one antenna dot at its precomputed position
+void drawAntennaDot(uint8_t index, uint16_t color)
+{
+  if (index < 1 || index > numDots)
+    return;
+
+  tft.fillCircle(dotX[index], dotY[index], DIAL_DOT_RADIUS, color);
+}
+
+// Draw all antenna markers in grey (base layer)
+void drawDialBase()
+{
+  for (uint8_t i = 1; i <= numDots; i++)
+  {
+    drawAntennaDot(i, TftGrey);
+  }
+}
+
+// Recolor all dots based on selected and pre-selected antenna
+void updateDialColors()
+{
+  for (uint8_t i = 1; i <= numDots; i++)
+  {
+    uint16_t color = TftGrey;
+
+    // Selected antenna -> GREEN
+    if (i == selectedAntenna)
+    {
+      color = TftGreen;
+    }
+
+    // Pre-selected antenna -> RED,
+    // but only if it is DIFFERENT from the selected one
+    if ((i == preSelectedAntenna) && (preSelectedAntenna != selectedAntenna))
+    {
+      color = TftRed;
+    }
+
+    drawAntennaDot(i, color);
+  }
+}
+
+// ============================================================================
+//                           ENCODER + BUTTON LOGIC
+// ============================================================================
+
+void updateEncoder()
+{
+  int dt = digitalRead(PIN_ENC_DT);
+  int clk = digitalRead(PIN_ENC_CLK);
+  uint8_t currentState = (dt << 1) | clk; // [DT, CLK] as 2 bits
+
+  uint8_t index = (lastState << 2) | currentState;
+  int8_t movement = encTable[index];
+
+  if (movement != 0)
+  {
+    encoderAccum += movement;
+    lastState = currentState;
+
+    if (encoderAccum >= STEPS_PER_NOTCH)
+    {
+      // One "click" clockwise -> next antenna
+      encoderAccum = 0;
+
+      if (selectedAntenna >= ANTENNA_MAX)
+        selectedAntenna = ANTENNA_MIN;
+      else
+        selectedAntenna++;
+
+      preSelectedAntenna = selectedAntenna; // keep UI in sync
+
+      Serial.print(F("[CLUB] ROTATE CW -> SELECT "));
+      Serial.println(selectedAntenna);
+
+      updateDialColors();
+      updateDynamicCornerLabels();
+      publishAntennaState("select_local", "CLUB_SWITCH");
+    }
+    else if (encoderAccum <= -STEPS_PER_NOTCH)
+    {
+      // One "click" counter-clockwise -> previous antenna
+      encoderAccum = 0;
+
+      if (selectedAntenna <= ANTENNA_MIN)
+        selectedAntenna = ANTENNA_MAX;
+      else
+        selectedAntenna--;
+
+      preSelectedAntenna = selectedAntenna; // keep UI in sync
+
+      Serial.print(F("[CLUB] ROTATE CCW -> SELECT "));
+      Serial.println(selectedAntenna);
+
+      updateDialColors();
+      updateDynamicCornerLabels();
+      publishAntennaState("select_local", "CLUB_SWITCH");
+    }
+  }
+  else
+  {
+    // Keep state in sync even on "no move" transitions
+    lastState = currentState;
+  }
+}
+
+// BUTTON (CLUB):
+//
+// Button is optional. Pressing it does not change the antenna;
+// it simply re-broadcasts the current state with reason "select_button".
+void updateButton()
+{
+  static int lastButtonSample = HIGH; // last raw reading
+  static int stableState      = HIGH; // debounced state
+
+  int reading = digitalRead(PIN_ENC_SW); // HIGH = released, LOW = pressed
+
+  // Raw change -> reset debounce timer
+  if (reading != lastButtonSample)
+  {
+    lastDebounceTime = millis();
+    lastButtonSample = reading;
+  }
+
+  // After debounce time, accept new state
+  if ((millis() - lastDebounceTime) > debounceDelayMs)
+  {
+    if (reading != stableState)
+    {
+      stableState = reading;
+
+      // Act on button press (active LOW)
+      if (stableState == LOW)
+      {
+        Serial.print(F("[CLUB] BUTTON PRESSED -> re-broadcast SELECT "));
+        Serial.println(selectedAntenna);
+
+        // No change to selected/preSelected, just re-send state
+        publishAntennaState("select_button", "CLUB_SWITCH");
+      }
+    }
+  }
+}
+
+// ============================================================================
+//                               SPIFFS UTILITIES
+// ============================================================================
+
+void mountAndListSPIFFS(uint8_t levels, bool listContent)
+{
+  Serial.println();
+
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println(F("❌ Failed to mount SPIFFS."));
+    return;
+  }
+  Serial.println(F("✅ SPIFFS mounted successfully!"));
+
+  if (!listContent)
+    return;
+
+  Serial.println(F("📂 Listing SPIFFS content:"));
+  fs::File root = SPIFFS.open("/");
+  if (!root || !root.isDirectory())
+  {
+    Serial.println(F("❌ Failed to open root directory or not a directory."));
+    return;
+  }
+
+  fs::File file = root.openNextFile();
+  while (file)
+  {
+    if (file.isDirectory())
+    {
+      Serial.print(F("  📁 DIR : "));
+      Serial.println(file.name());
+      if (levels)
+      {
+        // optional recursion over subdirs
+        mountAndListSPIFFS(levels - 1, true);
+      }
+    }
+    else
+    {
+      Serial.print(F("  📄 FILE: "));
+      Serial.print(file.name());
+      Serial.print(F("\tSIZE: "));
+      Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+
+  size_t total = SPIFFS.totalBytes();
+  size_t used  = SPIFFS.usedBytes();
+  size_t free  = total - used;
+  float  pctFree = (total > 0) ? ((float)free / total) * 100.0f : 0.0f;
+
+  Serial.println();
+  Serial.println(F("📊 SPIFFS Usage Info:"));
+  Serial.printf("   📦 Total: %u bytes\n", (unsigned)total);
+  Serial.printf("   📂 Used : %u bytes\n", (unsigned)used);
+  Serial.printf("   📭 Free : %u bytes (%.2f%%)\n", (unsigned)free, pctFree);
+  Serial.println();
+}
+
+// ============================================================================
+//                            PNGdec CALLBACKS + DRAW
+// ============================================================================
+
+void *fileOpen(const char *filename, int32_t *size)
+{
+  String fullPath = "/" + String(filename);
+  pngFile = SPIFFS.open(fullPath, "r");
+  if (!pngFile)
+    return nullptr;
+
+  *size = pngFile.size();
+  return (void *)&pngFile;
+}
+
+void fileClose(void *handle)
+{
+  ((fs::File *)handle)->close();
+}
+
+int32_t fileRead(PNGFILE *handle, uint8_t *buffer, int32_t length)
+{
+  return ((fs::File *)handle->fHandle)->read(buffer, length);
+}
+
+int32_t fileSeek(PNGFILE *handle, int32_t position)
+{
+  return ((fs::File *)handle->fHandle)->seek(position);
+}
+
+void pngDrawCallback(PNGDRAW *pDraw)
+{
+  static uint16_t lineBuffer[480];
+  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xFFFFFFFF);
+  tft.pushImage(0, pDraw->y, pDraw->iWidth, 1, lineBuffer);
+}
+
+void displayPNGfromSPIFFS(const char *filename, int duration_ms)
+{
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println(F("Failed to mount SPIFFS in displayPNGfromSPIFFS!"));
+    return;
+  }
+
+  int16_t rc = png.open(filename, fileOpen, fileClose,
+                        fileRead, fileSeek, pngDrawCallback);
+
+  if (rc == PNG_SUCCESS)
+  {
+    Serial.printf("Displaying PNG: %s\n", filename);
+    tft.startWrite();
+    png.decode(nullptr, 0);
+    tft.endWrite();
+  }
+  else
+  {
+    Serial.println(F("PNG decode failed."));
+  }
+
+  if (duration_ms > 0)
+    delay(duration_ms);
+}
+
+// ============================================================================
+//                           CORNER TEXT / OVERLAY
+// ============================================================================
+
+void drawStaticCornerLabels()
+{
+  int16_t w = tft.width();
+  int16_t h = tft.height();
+
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  // Bottom-left: "By HB9IIU"
+  tft.setTextDatum(BL_DATUM);
+  tft.drawString("By HB9IIU", 4, h - 4);
+
+  // Bottom-right: label for CLUB
+  tft.setTextDatum(BR_DATUM);
+  tft.drawString("CLUB 1.0", w - 4, h - 4);
+
+  // MQTT status LED will be drawn slightly above this text by drawMqttStatusDot()
+}
+
+// Update top-left and top-right labels with current preSelected antenna
+void updateDynamicCornerLabels()
+{
+  int16_t w = tft.width();
+
+  char bufAnt[16];
+  snprintf(bufAnt, sizeof(bufAnt), "Ant: %u", preSelectedAntenna);
+
+  char bufAz[16];
+  float az = dotAzimuthDeg[preSelectedAntenna];
+  snprintf(bufAz, sizeof(bufAz), "Az: %.0f deg.", az);
+
+  tft.setTextFont(2);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  // Top-left region
+  tft.fillRect(0, 0, 80, 20, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString(bufAnt, 4, 2);
+
+  // Top-right region
+  tft.fillRect(w - 100, 0, 100, 20, TFT_BLACK);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(bufAz, w - 4, 2);
+}
+
+// Draw the MQTT status "LED" above the CLUB 1.0 label
+void drawMqttStatusDot(bool forceRedraw)
+{
+  int16_t w = tft.width();
+  int16_t h = tft.height();
+
+  // Position for the LED: slightly above bottom-right label
+  int16_t cx = w - 20;
+  int16_t cy = h - 26;
+
+  // Color depends on MQTT connection state
+  uint16_t color = mqttClient.connected() ? TFT_GREEN : TFT_RED;
+
+  if (mqttLedOn || forceRedraw)
+  {
+    tft.fillCircle(cx, cy, MQTT_LED_RADIUS, color);
+  }
+  else
+  {
+    // "Off" state: erase with background color
+    tft.fillCircle(cx, cy, MQTT_LED_RADIUS, TFT_BLACK);
+  }
+}

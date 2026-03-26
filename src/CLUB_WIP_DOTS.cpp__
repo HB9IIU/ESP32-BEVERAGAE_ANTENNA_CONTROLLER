@@ -1,0 +1,3220 @@
+// ============================================================================
+//  CLUB_STATION.cpp
+//  Smart Beverage Antenna Selector — CLUBHOUSE STATION (CLUB / Authority)
+//  ----------------------------------------------------------------------
+//  Target: ESP32 + TFT_eSPI touchscreen display + KY-040 rotary encoder
+//
+//  Role
+//   - Authoritative controller and single source of truth for antenna state.
+//   - Accepts selection requests from:
+//       (1) local rotary encoder UI, and
+//       (2) MQTT commands from REMOTE panels.
+//   - Executes physical switching only on committed selections.
+//   - Publishes authoritative antenna state as a retained MQTT message.
+//
+//  Runtime Model
+//   - Encoder PREVIEW → COMMIT model:
+//       • Rotation updates a preview antenna (UI highlight only).
+//       • When rotation stops for PREVIEW_SETTLE_MS, preview is committed.
+//       • Hardware switching is executed once per commit.
+//       • Retained state is published after commit.
+//   - Map mode:
+//       • First encoder detent exits map view (no selection, no MQTT traffic).
+//
+//  Connectivity & Services
+//   - WiFi provisioning via HB9IIUPortal (AP name: HB9IIUPortal / beverage).
+//   - Secure MQTT via HiveMQ Cloud over TLS (port 8883).
+//   - ElegantOTA firmware updates served via WebServer (port 80).
+//   - SNTP time sync (UTC + local TZ for display).
+//
+//  MQTT Topics (CLUB role)
+//   - SUBSCRIBE: antenna/cmd        (selection requests from remotes)
+//   - PUBLISH  : antenna/state      (authoritative retained state)
+//   - PUBLISH  : antenna/heartbeat  (defined; optional / future use)
+//
+//  Design Guarantees
+//   - Deterministic state: no speculative reporting.
+//   - Hardware actions are edge-triggered on commit only (no relay/DTMF chatter).
+//   - REMOTE presence is inferred from received user commands only.
+//
+//  Author : Daniel / HB9IIU
+//  Date   : 2025-12-20
+//  Changes to apply om REMOTE
+//
+// ============================================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include "HB9IIUportalConfigurator.h"
+#include <FS.h>
+#include <LittleFS.h>
+#include <HB9IIUsimplePngDisplay.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <PNGdec.h>
+#include <Preferences.h>
+#include "nvs_flash.h"
+#include <ElegantOTA.h>
+#include <WebServer.h>
+#include <time.h>
+#include <lwip/apps/sntp.h>
+#include <Wire.h>
+#include "PCF8574.h" // Rob Tillaart PCF8574 library
+
+#define TFT_RGB_ORDER TFT_BGR
+// tft.invertDISPLAY(true);
+Preferences preferences;
+
+// ============================================================================
+//                               PANEL SETTINGS
+// ============================================================================
+
+// --- Remote Panel QTH (adjustable later)
+const float HOME_LAT_DEG = HOME_LAT_DEG_CFG;
+const float HOME_LON_DEG = HOME_LON_DEG_CFG;
+
+// ============================================================================
+//                                PIN DEFINITIONS
+// ============================================================================
+// See Platformio.ini for pin assignments
+// ============================================================================
+//                                MQTT CONFIGURATION
+// ============================================================================
+
+// Dynamic panel ID (default)
+String gPanelIdStr = "CLUBHOUSE STATION";
+const char *PANEL_ID = gPanelIdStr.c_str();
+
+// HiveMQ Cloud broker details
+const char *MQTT_HOST = "1db5ec5c4ff44e67bcb25a811f852e53.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT = 8883;
+const char *MQTT_USER = "esp32-club";
+const char *MQTT_PASSWD = "@V51bP9J@H";
+
+// MQTT topics
+const char *MQTT_TOPIC_STATE = "antenna/state";
+const char *MQTT_TOPIC_CMD = "antenna/cmd";
+const char *MQTT_TOPIC_HEARTBEAT = "antenna/heartbeat";
+
+// REMOTE interaction tracking (CLUB-side)
+unsigned long lastRemoteInteractionMs = 0;
+const unsigned long REMOTE_ACTIVE_MS = 5000; // 30 s window
+
+WiFiClientSecure mqttSecureClient;
+PubSubClient mqttClient(mqttSecureClient);
+
+// ============================================================================
+//                               OTA (ElegantOTA) SERVER
+// ============================================================================
+
+WebServer otaServer(80);
+
+// ============================================================================
+//                         GLOBAL DISPLAY / APP VARIABLES
+// ============================================================================
+
+TFT_eSPI tft = TFT_eSPI(); // TFT driver
+PNG png;
+fs::File pngFile;
+
+// ----------------------------------------------------------------------------
+// Views (pages)
+// ----------------------------------------------------------------------------
+enum View : uint8_t
+{
+    VIEW_DIAL = 0,
+    VIEW_MAP = 1,
+    VIEW_KEYPAD = 2,
+};
+
+static View gView = VIEW_DIAL;
+
+// Antenna dial settings
+const int16_t DIAL_RING_RADIUS = 149;
+const int16_t DIAL_DOT_RADIUS = 8;
+
+const uint8_t MAX_DOTS = 16;
+uint8_t numDots = 11;
+
+float dotAzimuthDeg[MAX_DOTS + 1];
+int16_t dotX[MAX_DOTS + 1];
+int16_t dotY[MAX_DOTS + 1];
+
+// Color palette
+uint16_t TftGrey, TftRed, TftYellow, TftGreen;
+
+// Pulse effect
+unsigned long lastPulseUpdate = 0;
+const unsigned long PULSE_INTERVAL_MS = 50;
+int pulseBrightness = 255;
+int pulseDirection = -15;
+
+// Encoder state
+int8_t encoderAccum = 0;
+uint8_t lastState = 0;
+const int STEPS_PER_NOTCH = 4;
+
+// Encoder lookup table
+const int8_t encTable[16] = {
+    0, +1, -1, 0,
+    -1, 0, 0, +1,
+    +1, 0, 0, -1,
+    0, -1, +1, 0};
+
+// Pending selection
+uint8_t pendingAntenna = 0;
+unsigned long lastEncoderMoveMs = 0;
+bool pendingSelection = false;
+const unsigned long SELECTION_DELAY_MS = 300;
+
+// Antenna limits
+uint8_t selectedAntenna = 1;
+uint8_t preSelectedAntenna = 1;
+const uint8_t ANTENNA_MIN = 1;
+uint8_t ANTENNA_MAX = 11;
+
+// Pulse trail
+const uint8_t TRAIL_LENGTH = 3;
+uint8_t trailIndices[TRAIL_LENGTH];
+uint8_t trailPos = 0;
+
+// Button debounce
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelayMs = 50;
+
+// ============================================================================
+//                           HEARTBEAT / CONNECTIVITY
+// ============================================================================
+
+// Heartbeat tracking
+unsigned long lastClubStateMs = 0;
+const unsigned long CLUB_TIMEOUT_MS = 20000; // 20 s
+const unsigned long CONNECT_LED_BLINK_MS = 700;
+
+bool awaitingClubConfirm = false;
+
+// ============================================================================
+//                           FUNCTION DECLARATIONS
+// ============================================================================
+
+// WiFi / MQTT
+void mqttSetup();
+bool mqttEnsureConnected();
+void mqttCallback(char *topic, byte *payload, unsigned int length);
+void publishSelectCommand();
+
+// OTA
+void setupElegantOTA();
+
+// TFT / Filesystem
+// void displayPicture(const char *imageName, int duration_ms);
+// void mountAndListSPIFFS(uint8_t levels = 255, bool listContent = true);
+void initAntennaDial();
+void initEncoderPins();
+
+// Encoder / Button
+void updateEncoder();
+void updateButton();
+
+// UI and Maps
+void updateDialColors();
+void updateDynamicCornerLabels(bool force = false);
+void drawAntennaDot(uint8_t index, uint16_t color);
+void drawWiFiIndicator();
+void drawMQTTIndicator();
+
+// Calibration
+void checkAndApplyTFTCalibrationData(bool recalibrate);
+void calibrateTFTscreen();
+
+// Factory Reset
+void performFactoryResetAll();
+
+String getStoredCallsign();
+void drawRemoteStationLabel();
+void loadDotConfig();
+void updateAllDotPositions();
+void drawDialBase();
+
+// --- Map geometry constants ---
+const int16_t MAP_X0 = 0;
+const int16_t MAP_Y0 = 0;
+const float MAP_W = 480.0f;
+const float MAP_H = 320.0f;
+
+void plotGreatCircle(float homeLat_deg, float homeLon_deg,
+                     float azimuth_deg,
+                     uint16_t color, uint8_t diameter);
+
+void updateMapBottomLabel();
+
+void displayIntroBanner();
+void printSystemInfo();
+void encodertestTFT();
+
+void mountAndListFiles();
+
+bool otaActive = false;
+bool waitForTimeVerbose(uint32_t timeoutMs = 15000);
+void printTimes();
+void drawLocalAndUTCTime(int16_t y, int16_t margin);
+
+int lastDrawnMinute = -1;
+void updateTimeIfMinuteChanged();
+
+static unsigned long lastUserInteractionMs = 0;
+const unsigned long USER_IDLE_MS = 300; // start conservative
+void printMQTTConnectionOK();
+void publishAntennaState(const char *reason);
+
+bool switchAntenna(uint8_t antenna);
+
+uint8_t previewAntenna = 0;
+unsigned long lastEncoderActivityMs = 0;
+const unsigned long PREVIEW_SETTLE_MS = 200; // try 200–500 later     300 it looks the best, with 200 sometimes unpredictable
+
+// DTMF
+uint8_t ht9200CodeFromChar(char c);
+bool ht9200PlayOne(char symbol, uint16_t toneMs = 300, uint16_t gapMs = 80);
+void ht9200Send5Bits(uint8_t code5);
+
+//-------------------------------------------------------------------------------------------------------------------
+// ALL THE BELOW BECAUSE OF NEW BUTTONS
+//-------------------------------------------------------------------------------------------------------------------
+#include <RobotoMono_Bold26pt7b.h>
+#include <RobotoMono_Medium13pt7b.h>
+#include <RobotoMono_Light8pt7b.h>
+
+#include <JetBrainsMono_Bold8pt7b.h>
+
+uint16_t VERY_LIGHT_GREY = tft.color565(230, 230, 230); // tweak 220–245 to taste
+
+void stepAntennaByButtons(int dir);
+void updateModeSelectButton();
+void onExtraLeftPressed();
+void onExtraRightPressed();
+void drawModeIndicator(bool force = false);
+void loadPresetsFromNVS();
+void savePresetToNVS(bool isLeftSlot, uint8_t antenna);
+
+enum OperatingMode : uint8_t
+{
+    MODE_A = 0,
+    MODE_B = 1
+};
+OperatingMode gMode = MODE_A; // default
+uint8_t presetLeft = 3;       // TEMP test value
+uint8_t presetRight = 7;      // TEMP test value
+const unsigned long BUTTON_DEBOUNCE_MS = 35;
+
+// --- TRX/SDR touch debounce (separate from the 100ms touch poll) ---
+static unsigned long lastTRXSDRTouchMs = 0;
+static const unsigned long TRX_SDR_DEBOUNCE_MS = 350; // increase this (e.g. 250..600)
+
+// --- Preset save arming (Mode B) ---
+bool presetSaveArmed = false;
+unsigned long presetSaveArmUntilMs = 0;
+
+const unsigned long MODE_LONGPRESS_MS = 1200;    // long press on GPIO25
+const unsigned long PRESET_ARM_WINDOW_MS = 5000; // save window duration
+
+// -----------------------------------------------------------------------------
+// Extra buttons (GPIO34/35) debounce state (active-low with external pull-ups)
+// -----------------------------------------------------------------------------
+static int lastLsample = HIGH, lStable = HIGH;
+static int lastRsample = HIGH, rStable = HIGH;
+static unsigned long lrLastChangeMs = 0;
+
+// -----------------------------------------------------------------------------
+// Mode select button (GPIO25 / encoder push) debounce state (INPUT_PULLUP)
+// -----------------------------------------------------------------------------
+static int lastModeSample = HIGH;
+static int modeStableState = HIGH;
+static unsigned long modeLastChangeMs = 0;
+
+void updateModeSelectButton()
+{
+    // We will detect short vs long press on RELEASE (clean + deterministic)
+    static bool pressed = false;
+    static unsigned long pressStartMs = 0;
+
+    int reading = digitalRead(PIN_ENC_SW); // HIGH=idle, LOW=pressed (INPUT_PULLUP)
+
+    // debounce
+    if (reading != lastModeSample)
+    {
+        modeLastChangeMs = millis();
+        lastModeSample = reading;
+    }
+
+    if ((millis() - modeLastChangeMs) <= BUTTON_DEBOUNCE_MS)
+        return;
+
+    // stable edge
+    if (reading != modeStableState)
+    {
+        modeStableState = reading;
+
+        // ---------- PRESS ----------
+        if (modeStableState == LOW)
+        {
+            lastUserInteractionMs = millis();
+
+            // If map is displayed: first press exits map only (no mode logic)
+            if (gView == VIEW_MAP)
+            {
+                gView = VIEW_DIAL;
+                displayImageOnTFT("greatcircleMap.png");
+                initAntennaDial();
+                drawModeIndicator(true); // FORCE
+                updateDynamicCornerLabels(true);
+                drawLocalAndUTCTime(240, 10);
+
+                // Do NOT start press timing in this case
+                pressed = false;
+                return;
+            }
+
+            pressed = true;
+            pressStartMs = millis();
+        }
+        // ---------- RELEASE ----------
+        else // HIGH
+        {
+            if (!pressed)
+                return;
+            pressed = false;
+
+            unsigned long heldMs = millis() - pressStartMs;
+
+            // LONG PRESS -> ARM SAVE (only meaningful in Mode B)
+            if (heldMs >= MODE_LONGPRESS_MS)
+            {
+                if (gMode == MODE_B)
+                {
+                    presetSaveArmed = true;
+                    presetSaveArmUntilMs = millis() + PRESET_ARM_WINDOW_MS;
+                    Serial.println("[UI ] Preset SAVE ARMED (5s) - press LEFT/RIGHT to store");
+                }
+                else
+                {
+                    Serial.println("[UI ] Long press ignored (not in Mode B)");
+                }
+
+                return; // long press does not toggle mode
+            }
+
+            // SHORT PRESS -> TOGGLE MODE
+            gMode = (gMode == MODE_A) ? MODE_B : MODE_A;
+            Serial.printf("[UI ] Mode -> %s\n", (gMode == MODE_A) ? "A" : "B");
+            drawModeIndicator(true); // FORCE
+        }
+    }
+
+    // Optional: auto-expire arming flag (kept here so it runs frequently)
+    if (presetSaveArmed && (millis() > presetSaveArmUntilMs))
+    {
+        presetSaveArmed = false;
+        Serial.println("[UI ] Preset SAVE disarmed (timeout)");
+    }
+}
+
+void onExtraLeftPressed()
+{
+    // MODE A: step CCW
+    if (gMode == MODE_A)
+    {
+        stepAntennaByButtons(-1);
+        return;
+    }
+
+    // MODE B:
+    if (presetSaveArmed)
+    {
+        // Save current antenna into LEFT slot
+        savePresetToNVS(true, selectedAntenna);
+
+        presetSaveArmed = false;
+        Serial.println("[UI ] Preset SAVE disarmed (stored LEFT)");
+        return;
+    }
+
+    // Normal recall
+    Serial.printf("[BTN] Recall LEFT preset -> antenna %u\n", presetLeft);
+
+    uint8_t target = presetLeft;
+    if (target >= ANTENNA_MIN && target <= ANTENNA_MAX && target != selectedAntenna)
+    {
+        if (switchAntenna(target))
+        {
+            selectedAntenna = target;
+            preSelectedAntenna = target;
+            updateDialColors();
+            updateDynamicCornerLabels();
+            publishAntennaState("preset_left");
+        }
+    }
+}
+
+void onExtraRightPressed()
+{
+    // MODE A: step CW
+    if (gMode == MODE_A)
+    {
+        stepAntennaByButtons(+1);
+        return;
+    }
+
+    // MODE B:
+    if (presetSaveArmed)
+    {
+        // Save current antenna into RIGHT slot
+        savePresetToNVS(false, selectedAntenna);
+
+        presetSaveArmed = false;
+        Serial.println("[UI ] Preset SAVE disarmed (stored RIGHT)");
+        return;
+    }
+
+    // Normal recall
+    Serial.printf("[BTN] Recall RIGHT preset -> antenna %u\n", presetRight);
+
+    uint8_t target = presetRight;
+    if (target >= ANTENNA_MIN && target <= ANTENNA_MAX && target != selectedAntenna)
+    {
+        if (switchAntenna(target))
+        {
+            selectedAntenna = target;
+            preSelectedAntenna = target;
+            updateDialColors();
+            updateDynamicCornerLabels();
+            publishAntennaState("preset_right");
+        }
+    }
+}
+
+// Active-low buttons with EXTERNAL pull-ups
+void updateExtraButtons()
+{
+    int l = digitalRead(PIN_PBL); // GPIO34
+    int r = digitalRead(PIN_PBR); // GPIO35
+
+    // debounce timing if either changed
+    if (l != lastLsample || r != lastRsample)
+    {
+        lrLastChangeMs = millis();
+        lastLsample = l;
+        lastRsample = r;
+    }
+
+    if ((millis() - lrLastChangeMs) > BUTTON_DEBOUNCE_MS)
+    {
+        // LEFT edge (trigger on press -> LOW)
+        if (l != lStable)
+        {
+            lStable = l;
+            if (lStable == LOW)
+                onExtraLeftPressed();
+        }
+
+        // RIGHT edge (trigger on press -> LOW)
+        if (r != rStable)
+        {
+            rStable = r;
+            if (rStable == LOW)
+                onExtraRightPressed();
+        }
+    }
+}
+
+uint8_t nextAntennaCW(uint8_t a)
+{
+    return (a >= ANTENNA_MAX) ? ANTENNA_MIN : (a + 1);
+}
+
+uint8_t nextAntennaCCW(uint8_t a)
+{
+    return (a <= ANTENNA_MIN) ? ANTENNA_MAX : (a - 1);
+}
+
+void stepAntennaByButtons(int dir) // dir: +1 = CW, -1 = CCW
+{
+    // Match encoder behavior: if map is displayed, first action exits map only
+    if (gView == VIEW_MAP)
+    {
+        gView = VIEW_DIAL;
+        displayImageOnTFT("greatcircleMap.png");
+        initAntennaDial();
+        drawModeIndicator(true); // FORCE
+        updateDynamicCornerLabels(true);
+        drawLocalAndUTCTime(240, 10);
+        return;
+    }
+
+    // If an encoder preview session was active, cancel it
+    previewAntenna = 0;
+
+    uint8_t target = selectedAntenna;
+
+    if (dir > 0)
+        target = nextAntennaCW(selectedAntenna);
+    else if (dir < 0)
+        target = nextAntennaCCW(selectedAntenna);
+
+    if (target == selectedAntenna)
+        return;
+
+    Serial.printf("[BTN] Step %s -> antenna %u\n", (dir > 0) ? "CW" : "CCW", target);
+
+    if (switchAntenna(target))
+    {
+        selectedAntenna = target;
+        preSelectedAntenna = target;
+
+        updateDialColors();
+        updateDynamicCornerLabels();
+
+        publishAntennaState((dir > 0) ? "btn_cw" : "btn_ccw");
+    }
+    else
+    {
+        Serial.println(F("[BTN] switchAntenna() FAILED; state not updated."));
+    }
+}
+
+void drawModeIndicator(bool force)
+{
+    static OperatingMode lastMode = (OperatingMode)255;
+
+    if (!force && gMode == lastMode)
+        return;
+
+    lastMode = gMode;
+
+    const int16_t x = 10;
+    const int16_t y = tft.height() / 2;
+
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextDatum(TL_DATUM);
+
+    // erase both possibilities (safe after PNG redraw too)
+    tft.setFreeFont(&RobotoMono_Light8pt7b);
+    tft.setTextColor(TFT_BLACK, TFT_BLACK);
+    tft.drawString("Mode A", x, y);
+    tft.drawString("Mode B", x, y);
+
+    // draw active
+    tft.setTextColor(VERY_LIGHT_GREY, TFT_BLACK);
+    if (gMode == MODE_A)
+        tft.drawString("Mode A", x, y);
+    else
+        tft.drawString("Mode B", x, y);
+
+    tft.setTextDatum(TL_DATUM);
+}
+
+void loadPresetsFromNVS()
+{
+    // Defaults if nothing stored yet
+    const uint8_t defL = 3;
+    const uint8_t defR = 7;
+
+    uint8_t l = defL;
+    uint8_t r = defR;
+
+    // IMPORTANT:
+    // Use read-write so the namespace is created if it doesn't exist yet.
+    // This avoids the noisy "nvs_open failed: NOT_FOUND" log.
+    if (preferences.begin("presets", false)) // read-write
+    {
+        l = (uint8_t)preferences.getUInt("left", defL);
+        r = (uint8_t)preferences.getUInt("right", defR);
+        preferences.end();
+    }
+
+    // Clamp to valid antenna range
+    if (l < ANTENNA_MIN || l > ANTENNA_MAX)
+        l = defL;
+    if (r < ANTENNA_MIN || r > ANTENNA_MAX)
+        r = defR;
+
+    presetLeft = l;
+    presetRight = r;
+
+    Serial.printf("[NVS] Presets loaded: LEFT=%u  RIGHT=%u\n", presetLeft, presetRight);
+}
+
+void savePresetToNVS(bool isLeftSlot, uint8_t antenna)
+{
+    if (antenna < ANTENNA_MIN || antenna > ANTENNA_MAX)
+    {
+        Serial.println("[NVS] Refusing to save invalid antenna number");
+        return;
+    }
+
+    if (!preferences.begin("presets", false)) // read-write
+    {
+        Serial.println("[NVS] preferences.begin(\"presets\") FAILED");
+        return;
+    }
+
+    if (isLeftSlot)
+    {
+        preferences.putUInt("left", antenna);
+        presetLeft = antenna;
+        Serial.printf("[NVS] Saved LEFT preset = %u\n", presetLeft);
+    }
+    else
+    {
+        preferences.putUInt("right", antenna);
+        presetRight = antenna;
+        Serial.printf("[NVS] Saved RIGHT preset = %u\n", presetRight);
+    }
+
+    preferences.end();
+}
+
+void setPanelGamma_TFT_eSPI()
+{
+
+    const uint8_t pos[15] = {0x00, 0x05, 0x0A, 0x05, 0x14, 0x08, 0x3F, 0x6F, 0x51, 0x07, 0x0B, 0x09, 0x22, 0x29, 0x0F};
+    const uint8_t neg[15] = {0x00, 0x13, 0x16, 0x04, 0x11, 0x07, 0x37, 0x46, 0x4D, 0x06, 0x10, 0x0E, 0x35, 0x37, 0x0F};
+
+    tft.startWrite();
+    tft.writecommand(0xE0);
+    for (int i = 0; i < 15; i++)
+        tft.writedata(pos[i]);
+
+    tft.writecommand(0xE1);
+    for (int i = 0; i < 15; i++)
+        tft.writedata(neg[i]);
+    tft.endWrite();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+void drawKeypadNavButton(bool force = false);
+bool hitKeypadNavButton(uint16_t x, uint16_t y);
+
+void enterKeypadView();
+void exitKeypadView();
+
+// Small NAV button to open keypad (kept away from bottom widgets)
+static const int16_t KEYPAD_NAV_X = 370;
+static const int16_t KEYPAD_NAV_Y = 285;
+static const int16_t KEYPAD_NAV_W = 70;
+static const int16_t KEYPAD_NAV_H = 34;
+static const int16_t KEYPAD_NAV_R = 8;
+
+// --- TRX/SDR button (left side, same size as RELAYS) ---
+static const int16_t TRX_SDR_X = KEYPAD_NAV_X - 290; // XXXXXXX
+static const int16_t TRX_SDR_Y = KEYPAD_NAV_Y;
+static const int16_t TRX_SDR_W = 40;
+static const int16_t TRX_SDR_H = KEYPAD_NAV_H;
+static const int16_t TRX_SDR_R = KEYPAD_NAV_R;
+
+// TRX/SDR state: false=TRX (relay OFF), true=SDR (relay ON)
+static bool gSDRmode = false;
+
+// Prototypes
+void drawTRX_SDRButton(bool force = false);
+bool hitTRX_SDRButton(uint16_t x, uint16_t y);
+void onTRX_SDRButtonPressed();
+
+// ---------------- PCF8574 ----------------
+static const uint8_t PCF_ADDR = 0x38;     // PCF8574A with A0/A1/A2=GND -> 0x38
+static const bool PCF_ACTIVE_LOW = false; // set true if your loads are active-LOW
+
+PCF8574 pcf(PCF_ADDR, &Wire);
+
+// ---------------- Keypad UI model ----------------
+struct ToggleBtn
+{
+    int16_t x, y, s; // square: s x s
+    const char *num;
+    String label;
+    bool active;
+};
+
+struct ActionBtn
+{
+    int16_t x, y, w, h;
+    const char *text;
+};
+
+static const uint8_t BTN_COUNT = 8;
+ToggleBtn b[BTN_COUNT];
+ActionBtn btnReturn;
+
+// Default labels (same as KEYPAD.cpp__)
+String labels[BTN_COUNT] = {
+    "Label 1", "Label 2", "Label 3", "Label 4",
+    "Label 5", "Label 6", "Label 7", "Label 8"};
+
+// --- Keypad / PCF page ---
+void layoutUI_480x320();
+void drawUI();
+void drawToggle(uint8_t i);
+void drawReturn();
+int hitToggle(uint16_t x, uint16_t y);
+bool hitReturn(uint16_t x, uint16_t y);
+void onReturnPressed();
+void pcfApplyFromButtons();
+void keypadTick(); // the “loop()” logic from KEYPAD.cpp__
+void drawKeypadNavButton(bool force)
+{
+    static bool drawn = false;
+
+    // Only show the nav button on MAIN page (DIAL) — nowhere else
+    if (gView != VIEW_DIAL)
+    {
+        drawn = false; // important: allow redraw when we come back to DIAL
+        return;
+    }
+
+    if (!force && drawn)
+        return;
+
+    uint16_t fill = tft.color565(90, 90, 90);
+    uint16_t border = TFT_LIGHTGREY;
+
+    tft.fillRoundRect(KEYPAD_NAV_X, KEYPAD_NAV_Y, KEYPAD_NAV_W, KEYPAD_NAV_H, KEYPAD_NAV_R, fill);
+    tft.drawRoundRect(KEYPAD_NAV_X, KEYPAD_NAV_Y, KEYPAD_NAV_W, KEYPAD_NAV_H, KEYPAD_NAV_R, border);
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    // tft.setFreeFont(&JetBrainsMono_Bold8pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, fill);
+    tft.drawString("RELAYS", KEYPAD_NAV_X + KEYPAD_NAV_W / 2, KEYPAD_NAV_Y + KEYPAD_NAV_H / 2);
+
+    drawn = true;
+}
+void drawTRX_SDRButton(bool force)
+{
+    static bool drawn = false;
+
+    // Only show on MAIN page (DIAL)
+    if (gView != VIEW_DIAL)
+    {
+        drawn = false; // allow redraw when returning to DIAL
+        return;
+    }
+
+    if (!force && drawn)
+        return;
+
+    uint16_t fill = tft.color565(90, 90, 90);
+    uint16_t border = TFT_LIGHTGREY;
+
+    tft.fillRoundRect(TRX_SDR_X, TRX_SDR_Y, TRX_SDR_W, TRX_SDR_H, TRX_SDR_R, fill);
+    tft.drawRoundRect(TRX_SDR_X, TRX_SDR_Y, TRX_SDR_W, TRX_SDR_H, TRX_SDR_R, border);
+
+    // Label depends on state
+    const char *label = gSDRmode ? "SDR" : "TRX";
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+
+    // tft.setFreeFont(&JetBrainsMono_Bold8pt7b);
+    tft.setTextColor(TFT_WHITE, fill);
+    tft.drawString(label, TRX_SDR_X + TRX_SDR_W / 2, TRX_SDR_Y + TRX_SDR_H / 2);
+
+    drawn = true;
+}
+
+bool hitKeypadNavButton(uint16_t x, uint16_t y)
+{
+    return (x >= KEYPAD_NAV_X && x < (KEYPAD_NAV_X + KEYPAD_NAV_W) &&
+            y >= KEYPAD_NAV_Y && y < (KEYPAD_NAV_Y + KEYPAD_NAV_H));
+}
+
+bool hitTRX_SDRButton(uint16_t x, uint16_t y)
+{
+    return (gView == VIEW_DIAL &&
+            x >= TRX_SDR_X && x < (TRX_SDR_X + TRX_SDR_W) &&
+            y >= TRX_SDR_Y && y < (TRX_SDR_Y + TRX_SDR_H));
+}
+
+void onTRX_SDRButtonPressed()
+{
+    gSDRmode = !gSDRmode;
+
+    // ON for SDR / OFF for TRX (as requested)
+    digitalWrite(PIN_REL_SDR_TRX, gSDRmode ? HIGH : LOW);
+
+    Serial.printf("[UI ] TRX/SDR toggle -> %s  (PIN_REL_SDR_TRX=%s)\n",
+                  gSDRmode ? "SDR" : "TRX",
+                  gSDRmode ? "ON" : "OFF");
+
+    // redraw button label
+    drawTRX_SDRButton(true);
+}
+
+void enterKeypadView()
+{
+    gView = VIEW_KEYPAD;
+
+    // Draw the real keypad UI (from the KEYPAD.cpp__ code you integrated)
+    drawUI();
+
+    // Optional: ensure outputs match current button states
+    // (safe even if nothing changed)
+    pcfApplyFromButtons();
+}
+
+void exitKeypadView()
+{
+    gView = VIEW_DIAL;
+
+    // Rebuild the dial page exactly like your normal flow
+    displayImageOnTFT("greatcircleMap.png");
+    initAntennaDial();
+    drawModeIndicator(true);
+    updateDynamicCornerLabels(true);
+    drawLocalAndUTCTime(240, 10);
+    drawKeypadNavButton(true);
+    drawTRX_SDRButton(true);
+}
+#define PCF_DEBUG 1
+
+void pcfApplyFromButtons()
+{
+    uint8_t v = 0;
+    for (uint8_t i = 0; i < BTN_COUNT; i++)
+    {
+        if (b[i].active)
+            v |= (1u << i);
+    }
+
+    uint8_t out = PCF_ACTIVE_LOW ? (uint8_t)~v : v;
+
+#if PCF_DEBUG
+    static bool first = true;
+    static uint8_t lastOut = 0xFF;
+
+    // Print only when value changes (keeps Serial readable)
+    if (first || out != lastOut)
+    {
+        Serial.printf("[PCF] UI=0x%02X -> OUT=0x%02X  (addr=0x%02X)%s\n",
+                      v, out, PCF_ADDR, PCF_ACTIVE_LOW ? " active-LOW" : "");
+
+        Serial.print("[PCF] OUT bits P7..P0 = ");
+        for (int8_t bit = 7; bit >= 0; bit--)
+        {
+            Serial.print((out >> bit) & 1);
+        }
+        Serial.println();
+
+        first = false;
+        lastOut = out;
+    }
+#endif
+
+    pcf.write8(out);
+
+#if PCF_DEBUG
+    int err = pcf.lastError(); // resets error to OK after reading
+    if (err != PCF8574_OK)
+    {
+        Serial.printf("[PCF] I2C error: 0x%02X\n", err);
+    }
+#endif
+}
+
+// ============================================================
+// FIXED layout for 480x320 with top & bottom margins
+// ============================================================
+void layoutUI_480x320()
+{
+    const int16_t S = 74;  // square button size
+    const int16_t GX = 24; // horizontal gap
+    const int16_t GY = 24; // vertical gap
+    const int16_t TOP_MARGIN = 0;
+    const int16_t LH = 18; // label height
+
+    const int16_t totalW = 4 * S + 3 * GX;
+    const int16_t startX = (480 - totalW) / 2;
+
+    const int16_t row1Y = TOP_MARGIN + 20;
+    const int16_t row2Y = row1Y + S + LH + GY;
+
+    static const char *nums[BTN_COUNT] = {"1", "2", "3", "4", "5", "6", "7", "8"};
+
+    for (int i = 0; i < 8; i++)
+    {
+        int col = i % 4;
+        int row = i / 4;
+
+        b[i].s = S;
+        b[i].x = startX + col * (S + GX);
+        b[i].y = (row == 0) ? row1Y : row2Y;
+        b[i].num = nums[i];
+        b[i].label = labels[i];
+        b[i].active = false;
+    }
+
+    btnReturn.x = startX;
+    btnReturn.w = totalW;
+    btnReturn.h = 44;
+    btnReturn.y = 320 - btnReturn.h - 10;
+    btnReturn.text = "Return";
+}
+
+// ------------------------------------------------------------
+// DRAWING FUNCTIONS
+// ------------------------------------------------------------
+void drawUI()
+{
+    tft.fillScreen(TFT_BLACK);
+    for (uint8_t i = 0; i < BTN_COUNT; i++)
+        drawToggle(i);
+    drawReturn();
+}
+
+void drawToggle(uint8_t i)
+{
+    const ToggleBtn &bt = b[i];
+
+    // Geometry
+    const int16_t r = 10;      // corner radius
+    const uint8_t borderT = 3; // border thickness in pixels
+
+    // Colors
+    uint16_t fill = bt.active ? tft.color565(40, 220, 90) : tft.color565(220, 40, 40);
+    uint16_t border = TFT_WHITE; // single border color
+    uint16_t text = bt.active ? TFT_BLACK : TFT_WHITE;
+    uint16_t labelC = tft.color565(210, 210, 210);
+
+    // --- Button body ---
+    tft.fillRoundRect(bt.x, bt.y, bt.s, bt.s, r, fill);
+
+    // --- Single thick border (no "double-outline gap") ---
+    // Draw several concentric outlines. This stays visually continuous.
+    for (uint8_t k = 0; k < borderT; k++)
+    {
+        tft.drawRoundRect(bt.x + k, bt.y + k, bt.s - 2 * k, bt.s - 2 * k, r - k, border);
+    }
+
+    // --- Big number ---
+    tft.setTextDatum(MC_DATUM);
+    tft.setFreeFont(&FreeSansBold18pt7b);
+    tft.setTextColor(text, fill);
+    tft.drawString(bt.num, bt.x + bt.s / 2, bt.y + bt.s / 2 + 2);
+
+    // --- Label under the button ---
+    tft.fillRect(bt.x, bt.y + bt.s + 2, bt.s, 20, TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(labelC, TFT_BLACK);
+    tft.drawString(bt.label, bt.x + bt.s / 2, bt.y + bt.s + 16);
+}
+
+void drawReturn()
+{
+    const int16_t r = 10;
+    uint16_t fill = tft.color565(30, 30, 30);
+    uint16_t border = tft.color565(160, 160, 160);
+
+    tft.fillRoundRect(btnReturn.x, btnReturn.y, btnReturn.w, btnReturn.h, r, fill);
+    tft.drawRoundRect(btnReturn.x, btnReturn.y, btnReturn.w, btnReturn.h, r, border);
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextColor(TFT_WHITE, fill);
+    tft.drawString(btnReturn.text, btnReturn.x + btnReturn.w / 2,
+                   btnReturn.y + btnReturn.h / 2 + 2);
+}
+
+// ------------------------------------------------------------
+// HIT DETECTION + CALLBACKS
+// ------------------------------------------------------------
+int hitToggle(uint16_t x, uint16_t y)
+{
+    for (int i = 0; i < BTN_COUNT; i++)
+    {
+        if (x >= b[i].x && x < (b[i].x + b[i].s) &&
+            y >= b[i].y && y < (b[i].y + b[i].s))
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool hitReturn(uint16_t x, uint16_t y)
+{
+    return (x >= btnReturn.x && x < (btnReturn.x + btnReturn.w) &&
+            y >= btnReturn.y && y < (btnReturn.y + btnReturn.h));
+}
+
+void onReturnPressed()
+{
+    // Return from keypad page back to your normal UI
+    gView = VIEW_DIAL;
+
+    displayImageOnTFT("greatcircleMap.png");
+    initAntennaDial();
+    drawModeIndicator(true);
+    updateDynamicCornerLabels(true);
+    drawLocalAndUTCTime(240, 10);
+    drawKeypadNavButton(true);
+    drawTRX_SDRButton(true);
+}
+
+void keypadTick()
+{
+    static bool fingerDown = false;
+    static uint32_t lastTouchMs = 0;
+
+    uint16_t x, y;
+    bool touched = tft.getTouch(&x, &y);
+
+    if (touched)
+    {
+        lastUserInteractionMs = millis(); // counts as user activity
+
+        if (fingerDown)
+            return;
+        if (millis() - lastTouchMs < 160)
+            return;
+
+        fingerDown = true;
+        lastTouchMs = millis();
+
+        if (hitReturn(x, y))
+        {
+            onReturnPressed();
+            return;
+        }
+
+        int idx = hitToggle(x, y);
+        if (idx >= 0)
+        {
+            b[idx].active = !b[idx].active;
+            drawToggle((uint8_t)idx);
+
+            // Sync PCF outputs P0..P7
+            pcfApplyFromButtons();
+
+            Serial.printf("[UI] Button %d -> %s\n", idx + 1, b[idx].active ? "ON" : "OFF");
+            return;
+        }
+
+        return; // empty tap = no action
+    }
+    else
+    {
+        fingerDown = false;
+    }
+}
+
+// ============================================================================
+//                                    SETUP
+// ============================================================================
+void setup()
+{
+    // ──────────────────────────────────────────────
+    // 1️⃣ Serial console & startup diagnostics
+    // ──────────────────────────────────────────────
+    Serial.begin(115200);
+
+    displayIntroBanner(); // Visual + serial intro banner
+    printSystemInfo();    // CPU, memory, flash, PSRAM summary
+    mountAndListFiles();  // LittleFS mount + file listing
+
+    // ──────────────────────────────────────────────
+    // 2️⃣  hardware initialization
+    // ──────────────────────────────────────────────
+    pinMode(TFT_BLP, OUTPUT); // TFT backlight control
+    initEncoderPins();        // Rotary encoder GPIO setup
+
+    // HT9200A DTMF
+    pinMode(PIN_DIN, OUTPUT);
+    pinMode(PIN_CLK, OUTPUT);
+    pinMode(PIN_CS, OUTPUT);
+    digitalWrite(PIN_DIN, LOW);
+    digitalWrite(PIN_CLK, HIGH);
+    digitalWrite(PIN_CS, LOW);
+
+    // LEFT and RIGHT buttons
+    pinMode(PIN_PBL, INPUT); // GPIO34 (external pull-up required)
+    pinMode(PIN_PBR, INPUT); // GPIO35 (external pull-up required)
+
+    // SDR-TRX Relay control
+    pinMode(PIN_REL_SDR_TRX, OUTPUT);
+    digitalWrite(PIN_REL_SDR_TRX, gSDRmode ? HIGH : LOW); // start consistent with label
+
+    tft.init();         // Initialize TFT controller
+    tft.setRotation(1); // Landscape orientation
+    tft.fillScreen(TFT_BLACK);
+    setPanelGamma_TFT_eSPI();
+
+    // Apply stored touchscreen calibration (or recalibrate if missing)
+    checkAndApplyTFTCalibrationData(false);
+
+    // Optional standalone encoder test (disabled in normal operation)
+    // encodertestTFT();
+
+    // ──────────────────────────────────────────────
+    // 3️⃣ Boot splash screen
+    // ──────────────────────────────────────────────
+    digitalWrite(TFT_BLP, LOW);    // Backlight off for clean splash
+    displayImageOnTFT("logo.png"); // Startup logo
+    digitalWrite(TFT_BLP, HIGH);   // Backlight on
+
+    // ──────────────────────────────────────────────
+    // 4️⃣ Define TFT color palette (used globally)
+    // ──────────────────────────────────────── ──────
+    TftGrey = tft.color565(100, 100, 100);
+    TftRed = tft.color565(255, 0, 0);
+    TftYellow = tft.color565(255, 255, 0);
+    TftGreen = tft.color565(0, 255, 0);
+
+    // ──────────────────────────────────────────────
+    // 5️⃣ Factory reset (encoder button held at boot)
+    // ──────────────────────────────────────────────
+    if (!digitalRead(PIN_ENC_SW))
+    {
+        performFactoryResetAll(); // Erases NVS and restarts
+    }
+
+    // ──────────────────────────────────────────────
+    // 6️⃣ Start WiFi configuration / captive portal
+    // ──────────────────────────────────────────────
+    HB9IIUPortal::begin("contest");
+
+    // ──────────────────────────────────────────────
+    // 7️⃣ Connected → normal operational mode
+    // ──────────────────────────────────────────────
+    if (HB9IIUPortal::isConnected())
+    {
+        // Retrieve stored callsign / panel ID
+        gPanelIdStr = getStoredCallsign();
+        PANEL_ID = gPanelIdStr.c_str();
+
+        Serial.println(F("──────────────────────────────────────────────"));
+        Serial.println(F("[APP] 📡 WiFi connected successfully"));
+        Serial.printf("   ↳ Remote Panel ID  : %s\n", PANEL_ID);
+        Serial.printf("   ↳ Local IP Address : %s\n",
+                      WiFi.localIP().toString().c_str());
+        Serial.println(F("──────────────────────────────────────────────\n"));
+
+        // Show main remote panel background
+        displayImageOnTFT("club.png");
+        drawRemoteStationLabel();
+
+        // Network services
+        mqttSetup(); // Secure MQTT client
+        publishAntennaState("boot");
+        setupElegantOTA(); // OTA web server
+
+        // Time synchronization (SNTP)
+        waitForTimeVerbose();
+        delay(1000);
+        printTimes();
+
+        // Initial UI state
+        displayImageOnTFT("greatcircleMap.png");
+        drawLocalAndUTCTime(240, 10);
+        initAntennaDial();
+        drawModeIndicator(true); // FORCE
+        loadPresetsFromNVS();
+
+        Serial.println(F("✅ Setup complete.\n"));
+    }
+
+    // ──────────────────────────────────────────────
+    // 8️⃣ Not connected → AP mode / connecting
+    // ──────────────────────────────────────────────
+    else
+    {
+        wifi_mode_t mode = WiFi.getMode();
+        wl_status_t status = WiFi.status();
+
+        Serial.println(F("──────────────────────────────────────────────"));
+        Serial.println(F("[APP] ⚠️  WiFi not connected at setup stage"));
+        Serial.printf("   ↳ Current WiFi mode : %s\n",
+                      (mode == WIFI_AP)       ? "Access Point (AP)"
+                      : (mode == WIFI_STA)    ? "Station (Client)"
+                      : (mode == WIFI_AP_STA) ? "AP + STA (mixed)"
+                                              : "WiFi OFF");
+
+        Serial.printf("   ↳ WiFi status       : %s\n",
+                      (status == WL_NO_SSID_AVAIL)    ? "No SSID available"
+                      : (status == WL_CONNECT_FAILED) ? "Connection failed"
+                      : (status == WL_DISCONNECTED)   ? "Disconnected"
+                      : (status == WL_IDLE_STATUS)    ? "Idle (trying...)"
+                      : (status == WL_CONNECTED)      ? "Connected (unexpected)"
+                                                      : "Unknown");
+        Serial.println();
+
+        Serial.println(F("   ↳ AP / portal mode active"));
+        Serial.println(F("   ↳ QR code and setup UI handled by HB9IIUPortal"));
+        Serial.println(F("──────────────────────────────────────────────\n"));
+
+        // Nothing else to do here:
+        // portal owns the TFT and user interaction until connected.
+    }
+
+    // KEYPAD NAV BUTTON
+    //  --- Keypad / PCF page ---
+    //  ---- I2C + PCF8574 init (for KEYPAD page) ----
+    Wire.begin(PIN_SDA, PIN_SCL);
+
+    if (!pcf.begin())
+    {
+        Serial.println("[PCF] begin() failed");
+    }
+    else if (!pcf.isConnected())
+    {
+        Serial.printf("[PCF] not connected at 0x%02X\n", PCF_ADDR);
+    }
+    else
+    {
+        Serial.printf("[PCF] OK at 0x%02X\n", PCF_ADDR);
+    }
+
+    // Prepare keypad layout once (positions, labels)
+    layoutUI_480x320();
+
+    // Make outputs match initial UI state (all OFF unless you change b[].active somewhere)
+    pcfApplyFromButtons();
+
+    drawKeypadNavButton(true);
+    drawTRX_SDRButton(true);
+}
+
+// ============================================================================
+//                                    LOOP
+// ============================================================================
+void loop()
+{
+    // ──────────────────────────────────────────────
+    // 0) User idle detection
+    // ──────────────────────────────────────────────
+    bool userIdle = (millis() - lastUserInteractionMs) > USER_IDLE_MS;
+
+    // ──────────────────────────────────────────────
+    // 1) Portal servicing (idle-only)
+    // ──────────────────────────────────────────────
+    if (userIdle)
+    {
+        HB9IIUPortal::loop();
+    }
+
+    // ──────────────────────────────────────────────
+    // 2) Connected operation
+    // ──────────────────────────────────────────────
+    if (HB9IIUPortal::isConnected())
+    {
+        // OTA servicing (always)
+        otaServer.handleClient();
+        ElegantOTA.loop();
+
+        // During OTA, suspend everything else
+        if (otaActive)
+        {
+            delay(5);
+            return;
+        }
+
+        // MQTT keep-alive
+        mqttClient.loop();
+
+        // ──────────────────────────────────────────────
+        // KEYPAD view owns touch handling (must run every loop)
+        // ──────────────────────────────────────────────
+        if (gView == VIEW_KEYPAD)
+        {
+            keypadTick();                // handles toggles + PCF + Return button
+            updateTimeIfMinuteChanged(); // optional, but harmless
+            return;                      // do NOT run antenna UI while keypad is active
+        }
+
+        // ──────────────────────────────────────────────
+        // 2a) High-priority physical inputs
+        //     (disable antenna UI inputs while KEYPAD view is active)
+        // ──────────────────────────────────────────────
+        if (gView != VIEW_KEYPAD)
+        {
+            updateModeSelectButton();
+            updateExtraButtons();
+            updateEncoder(); // only ONCE per loop
+        }
+
+        // ──────────────────────────────────────────
+        // Antenna pulse animation (dial view only)
+        // ──────────────────────────────────────────
+        if (!awaitingClubConfirm &&
+            (gView == VIEW_DIAL) &&
+            selectedAntenna >= ANTENNA_MIN &&
+            selectedAntenna <= ANTENNA_MAX)
+        {
+            unsigned long now = millis();
+
+            if (now - lastPulseUpdate >= PULSE_INTERVAL_MS)
+            {
+                lastPulseUpdate = now;
+                pulseBrightness += pulseDirection;
+
+                if (pulseBrightness <= 100 || pulseBrightness >= 255)
+                {
+                    pulseDirection = -pulseDirection;
+                    pulseBrightness = constrain(pulseBrightness, 100, 255);
+                }
+
+                uint16_t color = tft.color565(pulseBrightness, 0, 0); // RED
+
+                tft.drawCircle(dotX[selectedAntenna], dotY[selectedAntenna],
+                               DIAL_DOT_RADIUS + 1, TFT_WHITE);
+                drawAntennaDot(selectedAntenna, color);
+            }
+        }
+
+        // ──────────────────────────────────────────
+        // WiFi RSSI indicator (idle-only)
+        // ──────────────────────────────────────────
+        static long lastRssi = 0;
+        long rssi = WiFi.RSSI();
+        if (userIdle && abs(rssi - lastRssi) > 2)
+        {
+            drawWiFiIndicator();
+            lastRssi = rssi;
+        }
+
+        // ──────────────────────────────────────────
+        // MQTT status indicator (idle-only)
+        // ──────────────────────────────────────────
+        static unsigned long lastMQTTDraw = 0;
+        if (userIdle && millis() - lastMQTTDraw > 100)
+        {
+            lastMQTTDraw = millis();
+            drawMQTTIndicator();
+        }
+
+        // ──────────────────────────────────────────
+        // MQTT auto-reconnect watchdog (idle-only)
+        // ──────────────────────────────────────────
+        static unsigned long lastMQTTCheck = 0;
+        const unsigned long MQTT_RECHECK_MS = 10000;
+
+        if (userIdle && millis() - lastMQTTCheck >= MQTT_RECHECK_MS)
+        {
+            lastMQTTCheck = millis();
+
+            if (!mqttEnsureConnected())
+                Serial.println(F("[MQTT] Reconnect attempt failed"));
+            else
+                printMQTTConnectionOK();
+        }
+
+        // ──────────────────────────────────────────
+        // Touchscreen polling
+        // ──────────────────────────────────────────
+        static unsigned long lastTouchCheck = 0;
+        if (millis() - lastTouchCheck > 100)
+        {
+            lastTouchCheck = millis();
+
+            uint16_t x, y;
+            if (tft.getTouch(&x, &y))
+            {
+                lastUserInteractionMs = millis();
+
+                // ----------------------------
+                // If we are on KEYPAD page:
+                // only handle keypad interactions here
+                // ----------------------------
+                // TRX/SDR toggle button (DIAL only)
+                // TRX/SDR toggle button (DIAL only) + extra debounce
+                if (hitTRX_SDRButton(x, y))
+                {
+                    unsigned long now = millis();
+
+                    // ignore if pressed again too soon
+                    if (now - lastTRXSDRTouchMs < TRX_SDR_DEBOUNCE_MS)
+                        return;
+
+                    lastTRXSDRTouchMs = now;
+
+                    onTRX_SDRButtonPressed();
+                    return;
+                }
+
+                // ----------------------------
+                // From DIAL/MAP: open keypad if nav hit
+                // ----------------------------
+                if (hitKeypadNavButton(x, y))
+                {
+                    enterKeypadView();
+                    return;
+                }
+
+                // ----------------------------
+                // Otherwise: your original behavior
+                // toggle MAP <-> DIAL
+                // ----------------------------
+                gView = (gView == VIEW_MAP) ? VIEW_DIAL : VIEW_MAP;
+
+                if (gView != VIEW_MAP)
+                {
+                    displayImageOnTFT("greatcircleMap.png");
+                    initAntennaDial();
+                    drawModeIndicator(true);
+                    updateDynamicCornerLabels(true);
+                    drawLocalAndUTCTime(240, 10);
+                    drawKeypadNavButton(true);
+                    drawTRX_SDRButton(true);
+                }
+                else
+                {
+                    tft.fillScreen(TFT_BLACK);
+                    displayImageOnTFT("equirectangularMap.png");
+                    float az = dotAzimuthDeg[preSelectedAntenna];
+                    plotGreatCircle(HOME_LAT_DEG, HOME_LON_DEG, az, TFT_GOLD, 2);
+                    updateMapBottomLabel();
+                    drawWiFiIndicator();
+                    drawKeypadNavButton(true);
+                }
+
+                return;
+            }
+        }
+
+        // ──────────────────────────────────────────────
+        // Time update (minute resolution)
+        // ──────────────────────────────────────────────
+        updateTimeIfMinuteChanged();
+    }
+    else
+    {
+        // ──────────────────────────────────────────────
+        // 3) Not connected: portal waiting
+        // ──────────────────────────────────────────────
+        static unsigned long lastPortalMsg = 0;
+        if (millis() - lastPortalMsg > 5000)
+        {
+            lastPortalMsg = millis();
+            Serial.println(F("[PORTAL] Waiting for WiFi configuration..."));
+        }
+
+        // If you still want buttons usable while portal is showing,
+        // you can keep these uncommented. Otherwise leave off.
+        // updateModeSelectButton();
+        // updateExtraButtons();
+        // updateEncoder();
+    }
+}
+
+// ============================================================================
+//                            WIFI / MQTT HELPERS
+// ============================================================================
+
+void mqttSetup()
+{
+    Serial.println(F("[MQTT] Setting up secure client ..."));
+    mqttSecureClient.setInsecure();
+    mqttSecureClient.setTimeout(15000);
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+    mqttEnsureConnected();
+}
+
+bool mqttEnsureConnected()
+{
+    if (WiFi.status() != WL_CONNECTED)
+        return false;
+
+    if (mqttClient.connected())
+        return true;
+
+    Serial.println(F("[MQTT] (Re)connecting to broker..."));
+
+    String clientId = String("cyd-club-") + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWD))
+    {
+        Serial.println(F("[MQTT] Connected to HiveMQ Cloud"));
+
+        // ✅ CLUB MODE: subscribe to antenna commands
+        if (mqttClient.subscribe(MQTT_TOPIC_CMD))
+        {
+            Serial.print(F("[MQTT] Subscribed to "));
+            Serial.println(MQTT_TOPIC_CMD);
+        }
+        else
+        {
+            Serial.println(F("[MQTT] Failed to subscribe to antenna/cmd"));
+        }
+
+        return true;
+    }
+    else
+    {
+        Serial.print(F("[MQTT] Connection FAILED, rc="));
+        Serial.println(mqttClient.state());
+        return false;
+    }
+}
+
+void publishAntennaState(const char *reason)
+{
+    if (!mqttEnsureConnected())
+    {
+        Serial.println(F("[CLUB] Cannot publish state: MQTT not connected"));
+        return;
+    }
+
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"selected\":%u,\"pre\":%u,\"source\":\"CLUB\",\"reason\":\"%s\"}",
+             selectedAntenna,
+             selectedAntenna,
+             reason);
+
+    bool ok = mqttClient.publish(MQTT_TOPIC_STATE, payload, true); // retained
+
+    Serial.print(F("[CLUB] STATE -> "));
+    Serial.print(payload);
+    Serial.print(F("  (retained="));
+    Serial.print(ok ? F("OK") : F("FAIL"));
+    Serial.println(F(")"));
+}
+
+// Incoming MQTT messages (state + heartbeat from club)
+void mqttCallback(char *topic, byte *payload, unsigned int length)
+{
+    // CLUB MODE: receive antenna commands
+    if (strcmp(topic, MQTT_TOPIC_CMD) != 0)
+        return;
+
+    char buf[128];
+    if (length >= sizeof(buf))
+        length = sizeof(buf) - 1;
+
+    memcpy(buf, payload, length);
+    buf[length] = '\0';
+
+    int req = -1;
+    if (sscanf(buf, "{\"select\":%d", &req) == 1)
+    {
+        if (req >= ANTENNA_MIN && req <= ANTENNA_MAX)
+        {
+            // ── REMOTE interaction detected ───────────────────
+            lastRemoteInteractionMs = millis();
+
+            Serial.printf("[CLUB] REMOTE interaction: SELECT %d\n", req);
+
+            // Authoritative state update
+            selectedAntenna = req;
+            preSelectedAntenna = req;
+
+            updateDialColors();
+            updateDynamicCornerLabels();
+
+            // Publish authoritative state (retained)
+            publishAntennaState("mqtt");
+        }
+        else
+        {
+            Serial.printf("[CLUB] Invalid antenna index: %d\n", req);
+        }
+    }
+    else
+    {
+        Serial.print(F("[CLUB] Invalid MQTT payload: "));
+        Serial.println(buf);
+    }
+}
+
+// Publish a SELECT command to the club
+// Called on every encoder detent (immediate selection)
+void publishSelectCommand()
+{
+    Serial.println(F("[REMOTE] publishSelectCommand() called"));
+
+    if (!mqttEnsureConnected())
+    {
+        Serial.println(F("[REMOTE] mqttEnsureConnected() FAILED, not publishing."));
+        return;
+    }
+
+    char payload[80];
+    snprintf(payload, sizeof(payload),
+             "{\"select\":%u,\"source\":\"%s\"}",
+             selectedAntenna, PANEL_ID);
+
+    Serial.print(F("[REMOTE] SELECT -> "));
+    Serial.print(MQTT_TOPIC_CMD);
+    Serial.print(F(" : "));
+    Serial.println(payload);
+
+    bool ok = mqttClient.publish(MQTT_TOPIC_CMD, payload);
+    Serial.print(F("[REMOTE] mqttClient.publish(SELECT) returned: "));
+    Serial.println(ok ? F("true") : F("false"));
+}
+
+// ============================================================================
+//                            SYSTEM INIT HELPERS
+// ============================================================================
+
+void initAntennaDial()
+{
+    Serial.println(F("[INIT] Antenna dial"));
+
+    loadDotConfig();
+    ANTENNA_MAX = numDots;
+
+    updateAllDotPositions();
+    drawDialBase();
+
+    // IMPORTANT: do NOT reset selectedAntenna / preSelectedAntenna here.
+    // We want to keep whatever state we currently have from CLUB/REMOTE.
+    updateDialColors();
+
+    updateDynamicCornerLabels();
+}
+
+void initEncoderPins()
+{
+    Serial.println();
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    pinMode(PIN_ENC_DT, INPUT_PULLUP);  // Encoder A
+    pinMode(PIN_ENC_CLK, INPUT_PULLUP); // Encoder B
+    pinMode(PIN_ENC_SW, INPUT_PULLUP);  // Encoder button
+
+    // --- Capture initial electrical state ---
+    int dt = digitalRead(PIN_ENC_DT);
+    int clk = digitalRead(PIN_ENC_CLK);
+    int sw = digitalRead(PIN_ENC_SW);
+    lastState = (dt << 1) | clk;
+
+    // --- Explain each line clearly ---
+    Serial.println(F("GPIO configuration and idle signal state:"));
+    Serial.printf("   ↳ DT  pin : %-2d   (INPUT)  level=%d  → signal A, %s\n",
+                  PIN_ENC_DT, dt, dt ? "idle HIGH (open contact)" : "active LOW (closed to GND)");
+    Serial.printf("   ↳ CLK pin : %-2d   (INPUT)  level=%d  → signal B, %s\n",
+                  PIN_ENC_CLK, clk, clk ? "idle HIGH (open contact)" : "active LOW (closed to GND)");
+    Serial.printf("   ↳ SW  pin : %-2d   (INPUT_PULLUP) level=%d  → push-button, %s\n",
+                  PIN_ENC_SW, sw, sw ? "released (HIGH)" : "pressed (LOW)");
+
+    Serial.println();
+    Serial.printf("   ↳ Initial encoder state: 0b%02d (DT=%d, CLK=%d)\n", lastState, dt, clk);
+    Serial.println();
+    Serial.println(F("   ✅ Encoder GPIOs all configured as inputs."));
+    Serial.println(F("   Encoder lines read HIGH → mechanical contacts are open (idle state)."));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    Serial.println();
+}
+
+// ============================================================================
+//                             ANTENNA DIAL HELPERS
+// ============================================================================
+
+void loadDotConfig()
+{
+    numDots = 11;
+
+    dotAzimuthDeg[1] = 0.0f;
+    dotAzimuthDeg[2] = 20.0f;
+    dotAzimuthDeg[3] = 45.0f;
+    dotAzimuthDeg[4] = 60.0f;
+    dotAzimuthDeg[5] = 90.0f;
+    dotAzimuthDeg[6] = 135.0f;
+    dotAzimuthDeg[7] = 180.0f;
+    dotAzimuthDeg[8] = 225.0f;
+    dotAzimuthDeg[9] = 275.0f;
+    dotAzimuthDeg[10] = 310.0f;
+    dotAzimuthDeg[11] = 330.0f;
+}
+
+void updateAllDotPositions()
+{
+    int16_t cx = tft.width() / 2;
+    int16_t cy = tft.height() / 2;
+
+    for (uint8_t i = 1; i <= numDots; i++)
+    {
+        float rad = dotAzimuthDeg[i] * PI / 180.0f;
+        dotX[i] = cx + (int16_t)round(DIAL_RING_RADIUS * sin(rad));
+        dotY[i] = cy - (int16_t)round(DIAL_RING_RADIUS * cos(rad));
+    }
+}
+
+void setDotAzimuth(uint8_t index, float azimuthDeg)
+{
+    if (index < 1 || index > numDots)
+        return;
+
+    dotAzimuthDeg[index] = azimuthDeg;
+
+    int16_t cx = tft.width() / 2;
+    int16_t cy = tft.height() / 2;
+    float rad = azimuthDeg * PI / 180.0f;
+
+    dotX[index] = cx + (int16_t)round(DIAL_RING_RADIUS * sin(rad));
+    dotY[index] = cy - (int16_t)round(DIAL_RING_RADIUS * cos(rad));
+}
+
+void drawAntennaDot(uint8_t index, uint16_t color)
+{
+    if (index < 1 || index > numDots)
+        return;
+
+    tft.fillCircle(dotX[index], dotY[index], DIAL_DOT_RADIUS, color);
+    tft.drawCircle(dotX[index], dotY[index], DIAL_DOT_RADIUS + 1, TFT_WHITE);
+}
+
+void drawDialBase()
+{
+    for (uint8_t i = 1; i <= numDots; i++)
+        drawAntennaDot(i, TftGrey);
+}
+
+void updateDialColors()
+{
+    for (uint8_t i = 1; i <= numDots; i++)
+    {
+        uint16_t color = TftGrey;
+
+        if (i == selectedAntenna)
+            color = TftGreen;
+
+        if ((i == preSelectedAntenna) && (preSelectedAntenna != selectedAntenna))
+            color = TftRed;
+
+        drawAntennaDot(i, color);
+    }
+}
+
+// ============================================================================
+//                           ROTARY ENCODER LOGIC (FINAL)
+// ============================================================================
+//
+// Behaviour model (CLUB controller):
+//
+//   • Encoder rotation does NOT immediately switch antennas
+//   • Rotation enters a PREVIEW phase:
+//       - Selected antenna stays unchanged
+//       - Preview antenna is shown in YELLOW
+//       - Current active antenna remains GREEN
+//
+//   • When the user STOPS rotating for PREVIEW_SETTLE_MS:
+//       - Preview antenna is COMMITTED
+//       - switchAntenna() is called ONCE
+//       - MQTT authoritative state is published (retained)
+//
+// Safety / UX guarantees:
+//
+//   • No hardware chatter (DTMF / relays triggered once per selection)
+//   • Fast rotation is safe — only the final position matters
+//   • Deterministic behaviour (no speed-based heuristics)
+//
+// Special case:
+//
+//   • If the great-circle map is displayed:
+//       - The FIRST encoder detent exits the map
+//       - No antenna change occurs
+//       - No MQTT traffic is generated
+//
+// This function is called at high frequency from loop() and must remain
+// lightweight and deterministic.
+// ============================================================================
+
+void updateEncoder()
+{
+    int dt = digitalRead(PIN_ENC_DT);
+    int clk = digitalRead(PIN_ENC_CLK);
+    uint8_t currentState = (dt << 1) | clk;
+
+    uint8_t index = (lastState << 2) | currentState;
+    int8_t movement = encTable[index];
+
+    bool detent = false;
+
+    if (movement != 0)
+    {
+        encoderAccum += movement;
+        lastState = currentState;
+
+        if (encoderAccum >= STEPS_PER_NOTCH)
+        {
+            encoderAccum = 0;
+            detent = true;
+
+            // Exit map on first detent (unchanged)
+            if (gView == VIEW_MAP)
+            {
+                gView = VIEW_DIAL;
+                displayImageOnTFT("greatcircleMap.png");
+                initAntennaDial();
+                drawModeIndicator(true); // FORCE
+                updateDynamicCornerLabels(true);
+                drawLocalAndUTCTime(240, 10);
+                return;
+            }
+
+            // Start preview session if not active
+            if (previewAntenna == 0)
+                previewAntenna = selectedAntenna;
+
+            // CW
+            previewAntenna =
+                (previewAntenna >= ANTENNA_MAX) ? ANTENNA_MIN : (previewAntenna + 1);
+        }
+        else if (encoderAccum <= -STEPS_PER_NOTCH)
+        {
+            encoderAccum = 0;
+            detent = true;
+
+            // Exit map on first detent (unchanged)
+            if (gView == VIEW_MAP)
+            {
+                gView = VIEW_DIAL;
+                displayImageOnTFT("greatcircleMap.png");
+                initAntennaDial();
+                drawModeIndicator(true); // FORCE
+                updateDynamicCornerLabels(true);
+                drawLocalAndUTCTime(240, 10);
+                return;
+            }
+
+            // Start preview session if not active
+            if (previewAntenna == 0)
+                previewAntenna = selectedAntenna;
+
+            // CCW
+            previewAntenna =
+                (previewAntenna <= ANTENNA_MIN) ? ANTENNA_MAX : (previewAntenna - 1);
+        }
+    }
+    else
+    {
+        lastState = currentState;
+    }
+
+    // ──────────────────────────────────────────────
+    // Preview redraw
+    // ──────────────────────────────────────────────
+    if (detent)
+    {
+        lastUserInteractionMs = millis();
+        lastEncoderActivityMs = millis();
+
+        for (uint8_t i = 1; i <= ANTENNA_MAX; i++)
+        {
+            if (i == selectedAntenna)
+                drawAntennaDot(i, TftGreen);
+            else if (i == previewAntenna)
+                drawAntennaDot(i, TftYellow);
+            else
+                drawAntennaDot(i, TftGrey);
+        }
+
+        Serial.printf("[UI ] Preview antenna %u\n", previewAntenna);
+    }
+
+    // ──────────────────────────────────────────────
+    // Commit after settle time
+    // ──────────────────────────────────────────────
+    if (previewAntenna != 0 &&
+        (millis() - lastEncoderActivityMs) > PREVIEW_SETTLE_MS)
+    {
+        if (previewAntenna != selectedAntenna)
+        {
+            Serial.printf("[CLUB] Commit antenna %u\n", previewAntenna);
+
+            if (switchAntenna(previewAntenna))
+            {
+                selectedAntenna = previewAntenna;
+                preSelectedAntenna = selectedAntenna;
+
+                updateDialColors();
+                updateDynamicCornerLabels();
+
+                publishAntennaState("encoder");
+            }
+        }
+
+        // End preview session
+        previewAntenna = 0;
+    }
+}
+
+// Button is currently optional; if you want the button
+// to also send a SELECT with the current selectedAntenna,
+// just keep this function and call updateButton() from loop().
+void updateButton()
+{
+    static int lastButtonSample = HIGH;
+    static int stableState = HIGH;
+
+    int reading = digitalRead(PIN_ENC_SW); // HIGH = released, LOW = pressed
+
+    if (reading != lastButtonSample)
+    {
+        lastDebounceTime = millis();
+        lastButtonSample = reading;
+    }
+
+    if ((millis() - lastDebounceTime) > debounceDelayMs)
+    {
+        if (reading != stableState)
+        {
+            stableState = reading;
+
+            if (stableState == LOW)
+            {
+                Serial.print(F("[REMOTE] BUTTON: request select "));
+                Serial.println(selectedAntenna);
+
+                // Already selected locally; just confirm to CLUB if desired
+                publishSelectCommand();
+            }
+        }
+    }
+}
+
+// ============================================================================
+//                           CORNER TEXT / OVERLAY
+// ============================================================================
+void updateDynamicCornerLabels(bool force)
+{
+    static uint8_t lastAntenna = 255;
+    static int lastAzimuth = -999;
+    if (force)
+    {
+        lastAntenna = 255;
+        lastAzimuth = -999;
+    }
+    int16_t w = tft.width();
+
+    // --- Retrieve current values ---
+    uint8_t ant = preSelectedAntenna;
+    int az = round(dotAzimuthDeg[ant]);
+
+    // --- Label font ---
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextColor(VERY_LIGHT_GREY, TFT_BLACK);
+    tft.setFreeFont(&RobotoMono_Light8pt7b);
+
+    // --- Left side (Antenna) ---
+    tft.setTextDatum(TL_DATUM);
+
+    tft.drawString("Antenna", 6, 1);
+
+    // --- Right side (Azimuth) ---
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString("Azimuth", w - 6, 2);
+
+    // --- Value font ---
+    tft.setTextFont(4);
+    tft.setTextSize(1);
+
+    // --- Antenna value (left) ---
+    char bufAnt[8];
+    snprintf(bufAnt, sizeof(bufAnt), "%u", ant);
+
+    if (ant != lastAntenna)
+    {
+        // Use your FreeFont for BOTH erase + redraw
+        tft.setFreeFont(&RobotoMono_Bold26pt7b);
+        tft.setTextDatum(TR_DATUM);
+
+        // erase previous value (draw old one in black)
+        char bufOld[8];
+        snprintf(bufOld, sizeof(bufOld), "%u", lastAntenna);
+        tft.setTextColor(TFT_BLACK, TFT_BLACK);
+        tft.drawString(bufOld, 50, 24);
+
+        // draw new one
+        tft.setTextColor(VERY_LIGHT_GREY, TFT_BLACK);
+        tft.drawString(bufAnt, 50, 24);
+
+        lastAntenna = ant;
+    }
+
+    // --- Azimuth value (right) ---
+    char bufAz[16];
+    snprintf(bufAz, sizeof(bufAz), "%d%c", az, (char)176);
+
+    if (az != lastAzimuth)
+    {
+        tft.setFreeFont(&RobotoMono_Bold26pt7b);
+        tft.setTextDatum(TR_DATUM);
+
+        // erase previous value
+        char bufOld[16];
+        snprintf(bufOld, sizeof(bufOld), "%d%c", lastAzimuth, (char)176);
+        tft.setTextColor(TFT_BLACK, TFT_BLACK);
+        tft.drawString(bufOld, w - 10, 24);
+
+        // draw new value
+        tft.setTextColor(VERY_LIGHT_GREY, TFT_BLACK);
+        tft.drawString(bufAz, w - 10, 24);
+
+        lastAzimuth = az;
+
+        int r0 = 3; // inner radius
+
+        for (uint8_t i = 0; i < 3; i++)
+        {
+            tft.drawCircle(w - 7, 26, r0 + i, VERY_LIGHT_GREY);
+        }
+    }
+}
+
+String getStoredCallsign()
+{
+    String cs;
+
+    if (preferences.begin("config", true)) // read-only
+    {
+        cs = preferences.getString("callsign", "");
+        preferences.end();
+    }
+
+    return cs;
+}
+
+// -----------------------------------------------------------------------------
+//                         GREAT-CIRCLE / MAP HELPERS
+// -----------------------------------------------------------------------------
+
+// Convert latitude/longitude (deg) to TFT pixel coordinates (x,y)
+void latLonToXY(float lat_deg, float lon_deg, int16_t &x, int16_t &y)
+{
+    // Clamp latitude just in case
+    if (lat_deg > 90.0f)
+        lat_deg = 90.0f;
+    if (lat_deg < -90.0f)
+        lat_deg = -90.0f;
+
+    // Normalize longitude to [-180, +180]
+    while (lon_deg < -180.0f)
+        lon_deg += 360.0f;
+    while (lon_deg > 180.0f)
+        lon_deg -= 360.0f;
+
+    float xf = (lon_deg + 180.0f) / 360.0f * MAP_W;
+    float yf = (90.0f - lat_deg) / 180.0f * MAP_H;
+
+    x = MAP_X0 + (int16_t)roundf(xf);
+    y = MAP_Y0 + (int16_t)roundf(yf);
+}
+
+// Plot great-circle path from home toward a given azimuth
+void plotGreatCircle(float homeLat_deg, float homeLon_deg,
+                     float azimuth_deg,
+                     uint16_t color, uint8_t diameter)
+{
+    if (diameter == 0)
+        diameter = 1;
+    uint8_t radius = diameter / 2;
+
+    // Convert to radians
+    float lat1 = homeLat_deg * PI / 180.0f;
+    float lon1 = homeLon_deg * PI / 180.0f;
+    float brg = azimuth_deg * PI / 180.0f;
+
+    float sinLat1 = sinf(lat1);
+    float cosLat1 = cosf(lat1);
+    float sinBrg = sinf(brg);
+    float cosBrg = cosf(brg);
+
+    Serial.printf("Plotting great-circle: lat=%.4f lon=%.4f brg=%.2f°\n",
+                  homeLat_deg, homeLon_deg, azimuth_deg);
+
+    float prevLat = homeLat_deg;
+    bool goingNorth = (azimuth_deg < 90.0f || azimuth_deg > 270.0f);
+
+    for (float theta_deg = 0.0f; theta_deg <= 180.0f; theta_deg += 0.5f)
+    {
+        float d = theta_deg * PI / 180.0f;
+        float sinD = sinf(d);
+        float cosD = cosf(d);
+
+        // Forward geodesic
+        float lat2 = asinf(sinLat1 * cosD + cosLat1 * sinD * cosBrg);
+        lat2 = constrain(lat2, -PI / 2.0f, PI / 2.0f);
+
+        float lon2;
+        if (fabsf(sinBrg) < 1e-6f)
+        {
+            lon2 = lon1; // same meridian for due N/S
+        }
+        else
+        {
+            float yTerm = sinBrg * sinD * cosLat1;
+            float xTerm = cosD - sinLat1 * sinf(lat2);
+            lon2 = lon1 + atan2f(yTerm, xTerm);
+            if (lon2 < -PI)
+                lon2 += 2.0f * PI;
+            else if (lon2 > PI)
+                lon2 -= 2.0f * PI;
+        }
+
+        float lat2_deg = lat2 * 180.0f / PI;
+        float lon2_deg = lon2 * 180.0f / PI;
+
+        int16_t x, y;
+        latLonToXY(lat2_deg, lon2_deg, x, y);
+
+        if (x >= 0 && x < tft.width() && y >= 0 && y < tft.height())
+            tft.fillCircle(x, y, radius, color);
+
+        // --- Stop when latitude reverses (only for due N/S) ---
+        if ((fabsf(azimuth_deg) < 1.0f || fabsf(azimuth_deg - 180.0f) < 1.0f))
+        {
+            if ((goingNorth && lat2_deg < prevLat) ||
+                (!goingNorth && lat2_deg > prevLat))
+            {
+                break; // stop when motion reverses after pole
+            }
+            prevLat = lat2_deg;
+        }
+
+        // generic pole stop for all bearings
+        if (fabsf(lat2_deg) >= 89.9f)
+            break;
+    }
+}
+
+// Bottom label "Antenna N (xxx deg.)" on map
+void updateMapBottomLabel()
+{
+    float az = dotAzimuthDeg[preSelectedAntenna];
+
+    char buf[32];
+    snprintf(buf, sizeof(buf),
+             "Antenna %u (%.0f deg.)",
+             preSelectedAntenna, az);
+
+    tft.setTextFont(4);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+
+    // Clear band at bottom for label
+    tft.fillRect(0, 280, tft.width(), 40, TFT_BLACK);
+    tft.drawString(buf, tft.width() / 2, 295);
+}
+
+void drawRemoteStationLabel()
+{
+    char line[40];
+    snprintf(line, sizeof(line), "Station %s", PANEL_ID);
+
+    tft.setTextFont(4);
+    tft.setTextSize(1);
+
+    // ✅ Only one color argument → transparent background
+    tft.setTextColor(TFT_WHITE);
+
+    tft.setTextDatum(MC_DATUM);
+
+    int16_t centerX = tft.width() / 2;
+    int16_t centerY = 310;
+
+    // ❌ Don’t clear with fillRect — keep the image underneath
+    // tft.fillRect(0, 310, tft.width(), 40, TFT_BLACK);
+
+    // ✅ Draw transparent text directly on the picture
+    tft.drawString(line, centerX, centerY);
+}
+
+void performFactoryResetAll()
+{
+    int16_t w = tft.width();
+    int16_t h = tft.height();
+
+    Serial.println(F("[RESET] Performing factory reset: erasing ALL NVS (all Preferences)."));
+
+    // Simple message on TFT (no dialog, just info)
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextFont(4);
+    tft.setTextSize(1);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Factory Reset...", w / 2, h / 2 - 20);
+    tft.drawString("Erasing User Configuration", w / 2, h / 2 + 20);
+
+    // Erase the entire NVS partition: all namespaces, including "config",
+    // WiFi credentials, and anything stored by HB9IIUPortal.
+    esp_err_t err = nvs_flash_erase();
+    if (err == ESP_OK)
+    {
+        Serial.println(F("[RESET] nvs_flash_erase() OK."));
+    }
+    else
+    {
+        Serial.print(F("[RESET] nvs_flash_erase() ERROR: "));
+        Serial.println((int)err);
+    }
+
+    // Re-init NVS so the next boot has a clean state
+    err = nvs_flash_init();
+    if (err == ESP_OK)
+    {
+        Serial.println(F("[RESET] nvs_flash_init() OK after erase."));
+    }
+    else
+    {
+        Serial.print(F("[RESET] nvs_flash_init() ERROR: "));
+        Serial.println((int)err);
+    }
+
+    delay(2000);
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("Restarting...", w / 2, h / 2);
+    delay(2000);
+
+    ESP.restart(); // does not return
+}
+
+void setupElegantOTA()
+{
+    // HB9IIUPortal already connected WiFi.
+
+    otaServer.on("/", []()
+                 {
+                    Serial.println(F("[OTA] Redirecting to /update"));
+                     otaActive = true; // OTA upload really starts HERE
+
+                     otaServer.sendHeader("Location", "/update", true);
+                     otaServer.send(302, "text/plain", ""); });
+    otaServer.on(
+        "/update",
+        HTTP_POST,
+        []() {},              // final response handled by ElegantOTA
+        []() {                // upload handler
+            otaActive = true; // OTA upload really starts HERE
+        });
+    ElegantOTA.begin(&otaServer); // inject /update routes
+    otaServer.begin();
+
+    Serial.println(F("[OTA] ElegantOTA started on http://contest.local/update"));
+}
+void checkAndApplyTFTCalibrationData(bool recalibrate)
+{
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    Serial.println(F("[INIT] 🖥️  TFT Touch Calibration Check"));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+
+    if (recalibrate)
+    {
+        Serial.println(F("↪ Forced recalibration requested — launching calibration wizard..."));
+        calibrateTFTscreen();
+        return;
+    }
+
+    uint16_t calibrationData[5];
+    bool dataValid = true;
+
+    Serial.println(F("Reading stored calibration data from NVS namespace: 'TFT'"));
+    preferences.begin("TFT", true); // read-only mode
+
+    for (int i = 0; i < 5; i++)
+    {
+        calibrationData[i] = preferences.getUInt(("calib" + String(i)).c_str(), 0xFFFF);
+        if (calibrationData[i] == 0xFFFF)
+        {
+            dataValid = false;
+            Serial.printf("   ⚠️  calib%d = 0xFFFF → missing or invalid\n", i);
+        }
+        else
+        {
+            Serial.printf("   ✓ calib%d = %u\n", i, calibrationData[i]);
+        }
+    }
+    preferences.end();
+
+    if (dataValid)
+    {
+        tft.setTouch(calibrationData);
+        Serial.println();
+        Serial.println(F("✅ TFT touch calibration successfully retrieved and applied."));
+        Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    }
+    else
+    {
+        Serial.println();
+        Serial.println(F("❌ Calibration data invalid or incomplete."));
+        Serial.println(F("↪ Starting full recalibration procedure..."));
+        Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+        digitalWrite(TFT_BLP, HIGH);
+        calibrateTFTscreen();
+    }
+
+    Serial.println();
+}
+
+void calibrateTFTscreen()
+{
+    uint16_t calibrationData[5];
+
+    // Display recalibration message
+    tft.fillScreen(TFT_BLACK);             // Clear screen
+    tft.setTextColor(TFT_BLACK, TFT_GOLD); // Set text color (black on gold)
+    tft.setFreeFont(&FreeSansBold12pt7b);  // Use custom free font
+    tft.setCursor(10, 22);
+    tft.fillRect(0, 0, 480, 30, TFT_GOLD);
+    tft.print("   TFT TOUCHSCREEN CALIBRATION");
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    tft.setFreeFont(&FreeSans12pt7b);
+
+    String instructions[] = {
+        "Welcome to the initial touchscreen calibration.",
+        "This procedure will only be required once.",
+        "On the next screen you will see arrows",
+        "appearing one after the other at each corner.",
+        "Just tap them until completion.",
+        "",
+        "Tap anywhere on the screen to begin"};
+
+    int16_t yPos = 100;
+
+    for (String line : instructions)
+    {
+        int16_t xPos = (tft.width() - tft.textWidth(line)) / 2;
+        tft.setCursor(xPos, yPos);
+        tft.print(line);
+        yPos += tft.fontHeight();
+    }
+
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setCursor((tft.width() - tft.textWidth(instructions[6])) / 2, yPos - tft.fontHeight());
+    tft.print(instructions[6]);
+
+    while (true)
+    {
+        uint16_t x, y;
+        if (tft.getTouch(&x, &y))
+        {
+            break;
+        }
+    }
+
+    tft.fillScreen(TFT_BLACK);
+
+    tft.calibrateTouch(calibrationData, TFT_GREEN, TFT_BLACK, 12);
+
+    preferences.begin("TFT", false);
+    for (int i = 0; i < 5; i++)
+    {
+        preferences.putUInt(("calib" + String(i)).c_str(), calibrationData[i]);
+    }
+    preferences.end();
+
+    // Test calibration with dynamic feedback
+    tft.fillScreen(TFT_BLACK);
+    uint16_t x, y;
+    int16_t lastX = -1, lastY = -1;
+    String lastResult = "";
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextFont(4);
+    String text = "Tap anywhere to test";
+    tft.setCursor((tft.width() - tft.textWidth(text)) / 2, 8);
+    tft.print(text);
+
+    text = "Click Here to Exit";
+    int16_t btn_w = tft.textWidth(text) + 20;
+    int16_t btn_h = tft.fontHeight() + 12;
+    int16_t btn_x = (tft.width() - btn_w) / 2;
+    int16_t btn_y = 280;
+    int16_t btn_r = 10;
+
+    tft.fillRoundRect(btn_x, btn_y, btn_w, btn_h, btn_r, TFT_BLUE);
+    tft.drawRoundRect(btn_x, btn_y, btn_w, btn_h, btn_r, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_BLUE);
+    tft.setCursor((tft.width() - tft.textWidth(text)) / 2, btn_y + 10);
+    tft.print(text);
+
+    while (true)
+    {
+        if (tft.getTouch(&x, &y))
+        {
+            String result = "x=" + String(x) + "  y=" + String(y) + "  p=" + String(tft.getTouchRawZ());
+            lastUserInteractionMs = millis();
+            tft.setTextColor(TFT_BLACK, TFT_BLACK);
+            tft.setCursor(lastX, lastY);
+            tft.print(lastResult);
+
+            int16_t textWidth = tft.textWidth(result);
+            int16_t xPos = (tft.width() - textWidth) / 2;
+            int16_t yPos = (tft.height() - tft.fontHeight()) / 2;
+
+            tft.setTextColor(TFT_GREEN, TFT_BLACK);
+            tft.setCursor(xPos, yPos);
+            tft.print(result);
+
+            lastX = xPos;
+            lastY = yPos;
+            lastResult = result;
+
+            tft.fillCircle(x, y, 2, TFT_RED);
+
+            if (x > btn_x && x < btn_x + btn_w && y > btn_y && y < btn_y + btn_h)
+            {
+                Serial.println("Exit Touched");
+                break;
+            }
+        }
+    }
+    tft.setTextSize(2);
+    tft.fillScreen(TFT_BLACK);
+}
+
+void testTouchscreen()
+{
+    uint16_t x, y;
+    if (tft.getTouch(&x, &y))
+    {
+        // Draw red touch dot
+        tft.fillCircle(x, y, 4, TFT_RED);
+
+        // Show coordinates at top center
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setTextSize(2);
+        char buf[40];
+        sprintf(buf, "x=%d  y=%d", x, y);
+        tft.fillRect(0, 0, tft.width(), 30, TFT_BLACK);
+        tft.drawString(buf, tft.width() / 2, 10);
+        Serial.printf("🖱️  Touch at: x=%d y=%d\n", x, y);
+    }
+
+    delay(50);
+}
+
+void encodertestTFT()
+{
+    digitalWrite(TFT_BLP, HIGH);
+    // encoder test with TFT animation (improved visibility)
+    Serial.println("=== Encoder test mode (TFT ring animation) ===");
+
+    // better color contrast
+    uint16_t ledOff = tft.color565(70, 70, 70); // dim gray (more visible)
+    uint16_t ledOn = TFT_GREEN;                 // bright green
+    uint16_t ledCenter = TFT_YELLOW;            // center flash color
+
+    // clear screen
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextFont(2);
+    tft.drawCentreString("Encoder Test Mode", tft.width() / 2, 10, 4);
+
+    // ring geometry
+    const uint8_t NUM_LEDS = 16;
+    const int16_t cx = tft.width() / 2;
+    const int16_t cy = tft.height() / 2 + 10;
+    const int16_t RADIUS = 90;
+    const uint8_t LED_R = 9;
+
+    // precompute LED positions
+    int16_t ledX[NUM_LEDS], ledY[NUM_LEDS];
+    for (uint8_t i = 0; i < NUM_LEDS; i++)
+    {
+        float a = (360.0f / NUM_LEDS) * i * PI / 180.0f;
+        ledX[i] = cx + RADIUS * sin(a);
+        ledY[i] = cy - RADIUS * cos(a);
+    }
+
+    // draw ring LEDs off
+    for (uint8_t i = 0; i < NUM_LEDS; i++)
+        tft.fillCircle(ledX[i], ledY[i], LED_R, ledOff);
+
+    // encoder tracking
+    int dt = digitalRead(PIN_ENC_DT);
+    int clk = digitalRead(PIN_ENC_CLK);
+    uint8_t lastState = (dt << 1) | clk;
+    int8_t encoderAccum = 0;
+    int8_t ledIndex = 0;
+    unsigned long counter = 0;
+
+    // initial active LED
+    tft.fillCircle(ledX[ledIndex], ledY[ledIndex], LED_R, ledOn);
+
+    while (1)
+    {
+        dt = digitalRead(PIN_ENC_DT);
+        clk = digitalRead(PIN_ENC_CLK);
+        uint8_t currentState = (dt << 1) | clk;
+        uint8_t index = (lastState << 2) | currentState;
+        int8_t movement = encTable[index];
+
+        if (movement != 0)
+        {
+            encoderAccum += movement;
+            lastState = currentState;
+
+            if (encoderAccum >= STEPS_PER_NOTCH)
+            {
+                encoderAccum = 0;
+                counter++;
+                tft.fillCircle(ledX[ledIndex], ledY[ledIndex], LED_R, ledOff);
+                ledIndex = (ledIndex + 1) % NUM_LEDS;
+                tft.fillCircle(ledX[ledIndex], ledY[ledIndex], LED_R, ledOn);
+                Serial.printf("%lu CW\n", counter);
+            }
+            else if (encoderAccum <= -STEPS_PER_NOTCH)
+            {
+                encoderAccum = 0;
+                counter++;
+                tft.fillCircle(ledX[ledIndex], ledY[ledIndex], LED_R, ledOff);
+                ledIndex = (ledIndex - 1 + NUM_LEDS) % NUM_LEDS;
+                tft.fillCircle(ledX[ledIndex], ledY[ledIndex], LED_R, ledOn);
+                Serial.printf("%lu CCW\n", counter);
+            }
+        }
+        else
+        {
+            lastState = currentState;
+        }
+
+        // button animation
+        if (digitalRead(PIN_ENC_SW) == LOW)
+        {
+            Serial.printf("[%lu] Button pressed\n", counter);
+
+            // flash center with a "pulse" animation
+            for (int r = 5; r <= 20; r += 3)
+            {
+                tft.fillCircle(cx, cy, r, ledCenter);
+                delay(20);
+            }
+            delay(80);
+            for (int r = 20; r >= 5; r -= 3)
+            {
+                tft.fillCircle(cx, cy, r, TFT_BLACK);
+                delay(20);
+            }
+
+            // restore LED ring state
+            for (uint8_t i = 0; i < NUM_LEDS; i++)
+                tft.fillCircle(ledX[i], ledY[i], LED_R, ledOff);
+            tft.fillCircle(ledX[ledIndex], ledY[ledIndex], LED_R, ledOn);
+
+            delay(200);
+        }
+
+        delay(2);
+    }
+}
+
+void drawWiFiIndicator()
+{
+    int16_t x = 20;
+    int16_t y = 310;
+    int barWidth = 5;
+    int barHeight = 5;
+    int barGap = 3;
+
+    // clear background area for widget + text
+    tft.fillRect(x - 3, y - 20, 60, 28, TFT_BLACK);
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextFont(2);
+        tft.drawString("x", x + 10, y - 8);
+        tft.setTextFont(1);
+        tft.drawString("No WiFi", x, y);
+        return;
+    }
+
+    long rssi = WiFi.RSSI();          // dBm
+    rssi = constrain(rssi, -90, -40); // safety limits
+
+    // map RSSI -> 0..1 smooth factor
+    float t = (float)(rssi + 90) / 50.0f;
+
+    // smooth RGB gradient: red → yellow → green
+    uint8_t r, g, b;
+    if (t < 0.5f)
+    {
+        t *= 2.0f; // 0–1
+        r = 255;
+        g = (uint8_t)(t * 255);
+        b = 0;
+    }
+    else
+    {
+        t = (t - 0.5f) * 2.0f; // 0–1
+        r = (uint8_t)(255 * (1.0f - t));
+        g = 255;
+        b = 0;
+    }
+    uint16_t color = tft.color565(r, g, b);
+
+    // discrete level for bar count
+    uint8_t level = 0;
+    if (rssi > -55)
+        level = 4;
+    else if (rssi > -65)
+        level = 3;
+    else if (rssi > -75)
+        level = 2;
+    else if (rssi > -85)
+        level = 1;
+    else
+        level = 0;
+
+    // draw all 4 bars freshly each time (prevents old color residue)
+    for (uint8_t i = 0; i < 4; i++)
+    {
+        int barH = (i + 1) * barHeight;
+        int bx = x + i * (barWidth + barGap);
+        int by = y - barH - 5;
+
+        if (i < level)
+            tft.fillRect(bx, by, barWidth, barH, color);
+        else
+        {
+            // clear bar area first to remove previous fill
+            tft.fillRect(bx, by, barWidth, barH, TFT_BLACK);
+            tft.drawRect(bx, by, barWidth, barH, TFT_DARKGREY);
+        }
+    }
+
+    // --- Draw RSSI text below ---
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%ld dB", rssi);
+    tft.setTextFont(1);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawCentreString(buf, x + 20, y + 3, 1);
+}
+void drawMQTTIndicator()
+{
+    int16_t w = tft.width();
+    int16_t h = tft.height();
+
+    int16_t cx = w - 20; // bottom-right corner
+    int16_t cy = h - 10;
+    uint8_t r = 6;
+
+    // -------------------------------------------------
+    // Always draw WHITE outer ring (firmware alive)
+    // -------------------------------------------------
+    tft.drawCircle(cx, cy, r + 2, TFT_WHITE);
+
+    // -------------------------------------------------
+    // Determine states
+    // -------------------------------------------------
+    bool mqttOk = mqttClient.connected();
+
+    bool remoteRecentlyActive =
+        (lastRemoteInteractionMs != 0) &&
+        ((millis() - lastRemoteInteractionMs) < REMOTE_ACTIVE_MS);
+
+    static unsigned long lastBlink = 0;
+    static bool blinkState = false;
+    unsigned long now = millis();
+
+    uint16_t fillColor = TFT_BLACK; // default: empty
+
+    // -------------------------------------------------
+    // RED: MQTT down
+    // -------------------------------------------------
+    if (!mqttOk)
+    {
+        fillColor = TFT_RED;
+        blinkState = true; // solid red
+    }
+    // -------------------------------------------------
+    // GREEN blinking: REMOTE activity
+    // -------------------------------------------------
+    else if (remoteRecentlyActive)
+    {
+        fillColor = TFT_GREEN;
+
+        if (now - lastBlink >= 400)
+        {
+            blinkState = !blinkState;
+            lastBlink = now;
+        }
+    }
+    // -------------------------------------------------
+    // GREEN solid: MQTT OK, no REMOTE activity
+    // -------------------------------------------------
+    else
+    {
+        fillColor = TFT_GREEN;
+        blinkState = true; // solid
+    }
+
+    // -------------------------------------------------
+    // Draw filled indicator
+    // -------------------------------------------------
+    if (blinkState)
+    {
+        tft.fillCircle(cx, cy, r, fillColor);
+    }
+    else
+    {
+        // blinking OFF phase → clear inner only
+        tft.fillCircle(cx, cy, r, TFT_BLACK);
+    }
+}
+
+void displayIntroBanner()
+{
+
+    Serial.println();
+    Serial.println(F("╔══════════════════════════════════════════════════════════════════════════╗"));
+    Serial.println(F("║                                                                          ║"));
+    Serial.println(F("║                 🛰️  SMART BEVERAGE ANTENNA SELECTOR                       ║"));
+    Serial.println(F("║                               by HB9IIU                                  ║"));
+    Serial.println(F("║                                                                          ║"));
+    Serial.println(F("║                         🏠 CLUBHOUSE STATION                             ║"));
+    Serial.println(F("║                                                                          ║"));
+    Serial.println(F("╚══════════════════════════════════════════════════════════════════════════╝"));
+}
+
+void printSystemInfo()
+{
+    Serial.println();
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    Serial.println(F("[SYS] 📊  SYSTEM INFORMATION SUMMARY"));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+
+    // --- Collect system metrics ---
+    uint32_t flashSize = ESP.getFlashChipSize();
+    uint32_t sketchUsed = ESP.getSketchSize();
+    uint32_t sketchFree = ESP.getFreeSketchSpace();
+    uint32_t heapFree = ESP.getFreeHeap();
+    uint32_t heapTotal = ESP.getHeapSize();
+
+#if CONFIG_SPIRAM_SUPPORT
+    uint32_t psramFree = ESP.getFreePsram();
+    uint32_t psramTotal = ESP.getPsramSize();
+#endif
+
+    // --- Compute percentages ---
+    float flashUsedPct = (flashSize > 0) ? (100.0f * sketchUsed / flashSize) : 0.0f;
+    float heapUsedPct = (heapTotal > 0) ? (100.0f * (heapTotal - heapFree) / heapTotal) : 0.0f;
+#if CONFIG_SPIRAM_SUPPORT
+    float psramUsedPct = (psramTotal > 0) ? (100.0f * (psramTotal - psramFree) / psramTotal) : 0.0f;
+#endif
+
+    // --- Determine status verdicts ---
+    const char *flashVerdict = (flashUsedPct < 70.0f) ? "✅ OK" : (flashUsedPct < 85.0f) ? "⚠️  Moderate"
+                                                                                         : "❌ HIGH";
+    const char *heapVerdict = (heapUsedPct < 60.0f) ? "✅ OK" : (heapUsedPct < 80.0f) ? "⚠️  Moderate"
+                                                                                      : "❌ LOW";
+#if CONFIG_SPIRAM_SUPPORT
+    const char *psramVerdict = (psramUsedPct < 70.0f) ? "✅ OK" : (psramUsedPct < 85.0f) ? "⚠️  Moderate"
+                                                                                         : "❌ HIGH";
+#endif
+
+    // --- Print system info ---
+    Serial.printf("ESP32 Chip Model     : %s\n", ESP.getChipModel());
+    Serial.printf("CPU Cores            : %d\n", ESP.getChipCores());
+    Serial.printf("CPU Frequency        : %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("SDK Version          : %s\n", ESP.getSdkVersion());
+    Serial.printf("Flash Chip Size      : %-10u bytes\n", flashSize);
+    Serial.printf("Sketch Size (used)   : %-10u bytes  (%.1f%%)  → %s\n", sketchUsed, flashUsedPct, flashVerdict);
+    Serial.printf("Free Sketch Space    : %-10u bytes\n", sketchFree);
+    Serial.printf("Heap (free/total)    : %u / %u bytes  (used %.1f%%)  → %s\n",
+                  heapFree, heapTotal, heapUsedPct, heapVerdict);
+#if CONFIG_SPIRAM_SUPPORT
+    Serial.printf("PSRAM (free/total)   : %u / %u bytes  (used %.1f%%)  → %s\n",
+                  psramFree, psramTotal, psramUsedPct, psramVerdict);
+#endif
+
+    // --- Global verdict summary ---
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    if (flashUsedPct < 70.0f && heapUsedPct < 60.0f)
+        Serial.println(F("✅ System Health Summary : OK (Stable resources, OTA-capable)"));
+    else if (flashUsedPct < 85.0f && heapUsedPct < 80.0f)
+        Serial.println(F("⚠️  System Health Summary : Moderate (Monitor memory usage)"));
+    else
+        Serial.println(F("❌ System Health Summary : Critical (Risk of instability)"));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+}
+void mountAndListFiles()
+{
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    Serial.println(F("[INIT] 📂 LittleFS Mount & File Listing"));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+
+    Serial.print(F("Mounting LittleFS... "));
+    bool formatOnFail = true;
+    if (!LittleFS.begin(formatOnFail))
+    {
+        Serial.println(F("❌ FAILED"));
+        Serial.println(F("↪ LittleFS could not be mounted."));
+        Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+        Serial.println();
+        return;
+    }
+
+    Serial.println(F("OK"));
+
+    Serial.println();
+    Serial.println(F("📄 Listing filesystem contents:"));
+    Serial.println(F("---------------------------------------------------------------"));
+
+    File root = LittleFS.open("/");
+    if (!root || !root.isDirectory())
+    {
+        Serial.println(F("❌ Failed to open root directory."));
+        Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+        Serial.println();
+        return;
+    }
+
+    File file = root.openNextFile();
+    uint16_t fileCount = 0;
+    uint32_t totalSize = 0;
+
+    while (file)
+    {
+        fileCount++;
+        totalSize += file.size();
+
+        if (file.isDirectory())
+        {
+            Serial.printf("📁  %-24s\n", file.name());
+        }
+        else
+        {
+            Serial.printf("📄  %-24s  %8u bytes\n", file.name(), file.size());
+        }
+
+        file = root.openNextFile();
+    }
+
+    Serial.println(F("---------------------------------------------------------------"));
+    Serial.printf("📊 %u entries, %u bytes total\n", fileCount, totalSize);
+    Serial.println(F("✅ LittleFS mounted and ready."));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    Serial.println();
+}
+
+bool waitForTimeVerbose(uint32_t timeoutMs)
+{
+
+    configTime(0, 0,
+               "pool.ntp.org",
+               "time.google.com",
+               "time.cloudflare.com");
+    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+    tzset();
+
+    // Zurich, Paris, Berlin, Rome, Madrid
+    // setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+
+    // London
+    // setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
+
+    // Moscow (no DST)
+    // setenv("TZ", "MSK-3", 1);
+
+    // More https://support.cyberdata.net/portal/en/kb/articles/010d63c0cfce3676151e1f2d5442e311?utm_source=chatgpt.com
+
+    time_t now;
+    uint32_t start = millis();
+
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    Serial.println(F("[TIME] 🕒 SNTP Time Synchronization"));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+
+    // Network summary
+    Serial.printf("[NET ] 📡 IP   : %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[NET ] 🌐 DNS  : %s\n", WiFi.dnsIP().toString().c_str());
+
+    // DNS resolution test
+    Serial.print(F("[TIME] 🌐 Resolving NTP server... "));
+    IPAddress ntpIP;
+    if (WiFi.hostByName("pool.ntp.org", ntpIP))
+    {
+        Serial.print(F("OK → "));
+        Serial.println(ntpIP);
+    }
+    else
+    {
+        Serial.println(F("❌ FAILED"));
+    }
+
+    // SNTP configuration
+
+    Serial.println();
+    Serial.println(F("[TIME] ⚙️  SNTP configuration"));
+    Serial.println(F("---------------------------------------------------------------"));
+
+    int mode = sntp_getoperatingmode();
+
+    Serial.print("Mode        : ");
+    if (mode == SNTP_OPMODE_POLL)
+    {
+        Serial.println("POLL");
+    }
+    else if (mode == SNTP_OPMODE_LISTENONLY)
+    {
+        Serial.println("LISTEN");
+    }
+    else
+    {
+        Serial.println("UNKNOWN");
+    }
+    Serial.printf("Server [0]  : %s\n", sntp_getservername(0) ? sntp_getservername(0) : "(none)");
+    Serial.printf("Server [1]  : %s\n", sntp_getservername(1) ? sntp_getservername(1) : "(none)");
+    Serial.printf("Server [2]  : %s\n", sntp_getservername(2) ? sntp_getservername(2) : "(none)");
+
+    Serial.println(F("---------------------------------------------------------------"));
+    Serial.println();
+
+    // Wait loop
+    Serial.print(F("[TIME] ⏳ Waiting for valid epoch"));
+
+    while (millis() - start < timeoutMs)
+    {
+        time(&now);
+
+        Serial.print(F(" · "));
+        Serial.print(now);
+
+        if (now > 1700000000)
+        {
+            tm t;
+            Serial.println();
+            Serial.println(F("[TIME] 📅 Current time"));
+
+            gmtime_r(&now, &t);
+            Serial.printf("UTC   : %04d-%02d-%02d %02d:%02d:%02d\n",
+                          t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                          t.tm_hour, t.tm_min, t.tm_sec);
+
+            localtime_r(&now, &t);
+            Serial.printf("LOCAL : %04d-%02d-%02d %02d:%02d:%02d\n",
+                          t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                          t.tm_hour, t.tm_min, t.tm_sec);
+
+            Serial.println();
+            Serial.println(F("[TIME] ✅ SNTP synchronization successful"));
+            Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+            Serial.println();
+            return true;
+        }
+
+        delay(1000);
+    }
+
+    Serial.println();
+    Serial.println(F("[TIME] ❌ SNTP synchronization TIMEOUT"));
+    Serial.println(F("↪ No valid NTP response received."));
+    Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
+    Serial.println();
+
+    return false;
+}
+
+void printTimes()
+{
+    time_t now;
+    tm t;
+
+    time(&now);
+
+    gmtime_r(&now, &t);
+    Serial.printf("UTC   : %04d-%02d-%02d %02d:%02d:%02d\n",
+                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                  t.tm_hour, t.tm_min, t.tm_sec);
+
+    localtime_r(&now, &t);
+    Serial.printf("LOCAL : %04d-%02d-%02d %02d:%02d:%02d\n",
+                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                  t.tm_hour, t.tm_min, t.tm_sec);
+}
+
+void drawLocalAndUTCTime(int16_t y, int16_t margin)
+{
+    time_t now;
+    tm t;
+    time(&now);
+    y = y - 20;
+
+    // ── Font setup ─────────────────────────────────────────
+    tft.setTextFont(1); // REQUIRED for FreeFonts
+    tft.setFreeFont(&RobotoMono_Medium13pt7b);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    const int lineSpacing = 28;
+
+    // Useful metrics for clearing
+    const int timeY = y + lineSpacing;
+    const int timeH = tft.fontHeight() + 4;       // +padding
+    const int timeW = tft.textWidth("88:88") + 6; // +padding
+
+    // ── Labels ─────────────────────────────────────────────
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Local", margin, y);
+
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString("UTC", tft.width() - margin - 12, y);
+
+    // ── Local time ─────────────────────────────────────────
+    localtime_r(&now, &t);
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+
+    // Clear local time area (Top-Left anchored)
+    tft.fillRect(margin - 2, timeY - 2, timeW, timeH - 10, TFT_BLACK);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(buf, margin, timeY);
+
+    // ── UTC time ───────────────────────────────────────────
+    gmtime_r(&now, &t);
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+
+    int xRight = tft.width() - margin;
+
+    // Clear UTC time area (Top-Right anchored -> rectangle starts at xRight - timeW)
+    tft.fillRect(xRight - timeW + 2, timeY - 2, timeW + 4, timeH - 10, TFT_BLACK);
+
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, xRight, timeY);
+
+    // Restore safe defaults
+    tft.setTextDatum(TL_DATUM);
+}
+
+void updateTimeIfMinuteChanged()
+{
+    time_t now;
+    tm t;
+
+    time(&now);
+    localtime_r(&now, &t);
+
+    if (t.tm_min != lastDrawnMinute)
+    {
+        lastDrawnMinute = t.tm_min;
+
+        drawLocalAndUTCTime(240, 10);
+    }
+}
+void printMQTTConnectionOK()
+{
+    time_t now;
+    tm t;
+    time(&now);
+    localtime_r(&now, &t);
+
+    char ts[16];
+    snprintf(ts, sizeof(ts), "%02d:%02d:%02d",
+             t.tm_hour, t.tm_min, t.tm_sec);
+
+    Serial.printf("[MQTT] Connection OK @ %s\n", ts);
+}
+
+bool switchAntenna(uint8_t antenna)
+{
+    Serial.printf("[HW ] switchAntenna(%u)\n", antenna);
+
+    char dtmf = '\0';
+    if (antenna >= 1 && antenna <= 9)
+        dtmf = char('0' + antenna);
+    else if (antenna == 10)
+        dtmf = '0';
+    else if (antenna == 11)
+        dtmf = '*';
+    else
+    {
+        Serial.println("[HW ] Invalid antenna index (must be 1..11)");
+        return false;
+    }
+
+    Serial.printf("[HW ] DTMF = '%c'\n", dtmf);
+
+    // EXACT same behavior as the working player
+    return ht9200PlayOne(dtmf, 60, 1);
+}
+
+uint8_t ht9200CodeFromChar(char c)
+{
+    switch (c)
+    {
+    case '1':
+        return 0x01;
+    case '2':
+        return 0x02;
+    case '3':
+        return 0x03;
+    case '4':
+        return 0x04;
+    case '5':
+        return 0x05;
+    case '6':
+        return 0x06;
+    case '7':
+        return 0x07;
+    case '8':
+        return 0x08;
+    case '9':
+        return 0x09;
+    case '0':
+        return 0x0A;
+    case '*':
+        return 0x0B;
+    case '#':
+        return 0x0C;
+    case 'A':
+    case 'a':
+        return 0x0D;
+    case 'B':
+    case 'b':
+        return 0x0E;
+    case 'C':
+    case 'c':
+        return 0x0F;
+    case 'D':
+    case 'd':
+        return 0x00;
+    default:
+        return 0xFF;
+    }
+}
+
+bool ht9200PlayOne(char symbol, uint16_t toneMs, uint16_t gapMs)
+{
+    uint8_t code = ht9200CodeFromChar(symbol);
+    if (code == 0xFF)
+    {
+        Serial.print("Skipping invalid symbol: ");
+        Serial.println(symbol);
+        return false;
+    }
+
+    Serial.print("Tone: ");
+    Serial.println(symbol);
+
+    ht9200Send5Bits(code);
+    delay(toneMs);
+    ht9200Send5Bits(0x1F);
+    delay(gapMs);
+
+    return true;
+}
+void ht9200Send5Bits(uint8_t code5)
+{
+    for (int i = 0; i < 5; i++)
+    {
+        digitalWrite(PIN_DIN, (code5 >> i) & 0x01);
+        digitalWrite(PIN_CLK, LOW);
+        delayMicroseconds(80);
+        digitalWrite(PIN_CLK, HIGH);
+        delayMicroseconds(80);
+    }
+}

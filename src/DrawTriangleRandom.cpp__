@@ -1,0 +1,330 @@
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <PNGdec.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <math.h>
+
+#ifndef TFT_BLP
+#define TFT_BLP -1
+#endif
+
+TFT_eSPI tft;
+PNG png;
+
+// =============================
+// Types
+// =============================
+struct PtF { float x, y; };
+struct PtI { int x, y; };
+
+// =============================
+// Globals
+// =============================
+
+// PNGdec FS callbacks
+static File g_pngFile;
+
+// Region redraw state
+static int g_imgX = 0;
+static int g_imgY = 0;
+
+static bool g_useClip = false;
+static int g_clipX = 0;
+static int g_clipY = 0;
+static int g_clipW = 0;
+static int g_clipH = 0;
+
+static uint16_t *g_lineBuf = nullptr;
+static int g_pngWidth = 0;
+
+// Demo: background + moving shape
+static const char *BG = "/greatcircleMap.png";
+
+static int prevBX = 0, prevBY = 0, prevBW = 0, prevBH = 0;
+static bool havePrev = false;
+
+static uint32_t nextFrameAt = 0;
+
+// =============================
+// Function prototypes
+// =============================
+
+// PNGdec FS callbacks
+void*   pngOpen(const char *filename, int32_t *size);
+void    pngClose(void *handle);
+int32_t pngRead(PNGFILE *page, uint8_t *buffer, int32_t length);
+int32_t pngSeek(PNGFILE *page, int32_t position);
+
+// PNG drawing helpers
+bool ensureLineBuf(int w);
+void pngDraw(PNGDRAW *pDraw);
+bool drawPng(const char *filename, int x, int y);
+bool redrawPngRegion(const char *filename, int imgX, int imgY, int clipX, int clipY, int clipW, int clipH);
+
+// Geometry / drawing helpers
+PtF  rotRel(const PtF& p, float rad);
+void computeNotchedTrianglePoints(int orbitAngleDeg, int radius, int side, PtI &top, PtI &left, PtI &right, PtI &notch);
+void drawNotchedTriangle(const PtI &top, const PtI &left, const PtI &right, const PtI &notch, uint16_t fillColor, uint16_t outlineColor);
+void bboxOf(const PtI &a, const PtI &b, const PtI &c, const PtI &d, int &x, int &y, int &w, int &h);
+bool clampRectToScreen(int &x, int &y, int &w, int &h);
+
+// Optional alternative loop
+void loop1();
+
+// =============================
+// setup / loop
+// =============================
+void setup() {
+  Serial.begin(115200);
+
+
+  pinMode(TFT_BLP, OUTPUT);
+  digitalWrite(TFT_BLP, HIGH);
+
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed");
+  }
+
+  // Draw background once
+  if (!drawPng(BG, 0, 0)) {
+    Serial.println("Background draw failed. Check LittleFS path: /greatcircleMap.png");
+  }
+
+}
+
+void loop() {
+  const int radius = 120;
+  const int side   = 30;
+
+
+ 
+
+  // 1) Restore previous triangle area
+  if (havePrev) {
+    int x = prevBX, y = prevBY, w = prevBW, h = prevBH;
+    if (clampRectToScreen(x, y, w, h)) {
+      redrawPngRegion(BG, 0, 0, x, y, w, h);
+    }
+  }
+
+  // 2) Pick random angle
+  int angle = random(0, 360);
+
+  // 3) Compute/draw new triangle
+  PtI top, left, right, notch;
+  computeNotchedTrianglePoints(angle, radius, side, top, left, right, notch);
+  drawNotchedTriangle(top, left, right, notch, TFT_RED, TFT_WHITE);
+
+  // 4) Save bbox for next restore
+  bboxOf(top, left, right, notch, prevBX, prevBY, prevBW, prevBH);
+  havePrev = true;
+
+  delay(300); // PNG decode is heavy; adjust
+}
+
+
+
+
+// ===============================================
+// Function implementations (for stupid triangle)
+// ===============================================
+
+// ---------- PNGdec FS callbacks ----------
+void* pngOpen(const char *filename, int32_t *size) {
+  g_pngFile = LittleFS.open(filename, "r");
+  if (!g_pngFile) return nullptr;
+  *size = g_pngFile.size();
+  return (void*)&g_pngFile;
+}
+
+void pngClose(void *handle) {
+  File *f = (File*)handle;
+  if (f) f->close();
+}
+
+int32_t pngRead(PNGFILE *page, uint8_t *buffer, int32_t length) {
+  File *f = (File*)page->fHandle;
+  return f->read(buffer, length);
+}
+
+int32_t pngSeek(PNGFILE *page, int32_t position) {
+  File *f = (File*)page->fHandle;
+  return f->seek(position) ? position : -1;
+}
+
+// ---------- PNG helpers ----------
+bool ensureLineBuf(int w) {
+  if (g_lineBuf && g_pngWidth == w) return true;
+  if (g_lineBuf) { free(g_lineBuf); g_lineBuf = nullptr; }
+  g_pngWidth = w;
+
+  g_lineBuf = (uint16_t*)malloc(g_pngWidth * sizeof(uint16_t));
+  if (!g_lineBuf) {
+    Serial.println("No RAM for line buffer");
+    return false;
+  }
+  return true;
+}
+
+void pngDraw(PNGDRAW *pDraw) {
+  const int yAbs = g_imgY + pDraw->y;
+
+  if (g_useClip) {
+    if (yAbs < g_clipY || yAbs >= (g_clipY + g_clipH)) return;
+  }
+
+  // BIG_ENDIAN + setSwapBytes(false) matched your correct colors
+  png.getLineAsRGB565(pDraw, g_lineBuf, PNG_RGB565_BIG_ENDIAN, 0xFFFFFFFF);
+
+  int drawLeft  = 0;
+  int drawRight = (int)pDraw->iWidth;
+
+  if (g_useClip) {
+    int clipLeft  = g_clipX - g_imgX;
+    int clipRight = clipLeft + g_clipW;
+
+    drawLeft  = max(drawLeft,  clipLeft);
+    drawRight = min(drawRight, clipRight);
+
+    if (drawRight <= drawLeft) return;
+  }
+
+  const int span = drawRight - drawLeft;
+  const int xAbs = g_imgX + drawLeft;
+
+  tft.pushImage(xAbs, yAbs, span, 1, g_lineBuf + drawLeft);
+}
+
+bool drawPng(const char *filename, int x, int y) {
+  g_imgX = x; g_imgY = y;
+  g_useClip = false;
+
+  int16_t rc = png.open(filename, pngOpen, pngClose, pngRead, pngSeek, pngDraw);
+  if (rc != PNG_SUCCESS) {
+    Serial.printf("PNG open failed (%d)\n", rc);
+    return false;
+  }
+
+  int w = png.getWidth();
+  if (!ensureLineBuf(w)) {
+    png.close();
+    return false;
+  }
+
+  tft.setSwapBytes(false);
+  png.decode(nullptr, 0);
+  png.close();
+  return true;
+}
+
+bool redrawPngRegion(const char *filename,
+                     int imgX, int imgY,
+                     int clipX, int clipY, int clipW, int clipH) {
+  g_imgX = imgX; g_imgY = imgY;
+
+  g_useClip = true;
+  g_clipX = clipX; g_clipY = clipY; g_clipW = clipW; g_clipH = clipH;
+
+  int16_t rc = png.open(filename, pngOpen, pngClose, pngRead, pngSeek, pngDraw);
+  if (rc != PNG_SUCCESS) {
+    Serial.printf("PNG open failed (%d)\n", rc);
+    g_useClip = false;
+    return false;
+  }
+
+  int w = png.getWidth();
+  if (!ensureLineBuf(w)) {
+    png.close();
+    g_useClip = false;
+    return false;
+  }
+
+  tft.setSwapBytes(false);
+  png.decode(nullptr, 0);
+  png.close();
+
+  g_useClip = false;
+  return true;
+}
+
+// ---------- Geometry / drawing helpers ----------
+PtF rotRel(const PtF& p, float rad) {
+  float s = sinf(rad), c = cosf(rad);
+  return { (p.x * c - p.y * s), (p.x * s + p.y * c) };
+}
+
+void computeNotchedTrianglePoints(int orbitAngleDeg, int radius, int side,
+                                  PtI &top, PtI &left, PtI &right, PtI &notch) {
+  int centerX = tft.width()  / 2;
+  int centerY = tft.height() / 2;
+
+  float th = orbitAngleDeg * (float)M_PI / 180.0f;
+  float cx = (float)centerX + radius * cosf(th);
+  float cy = (float)centerY + radius * sinf(th);
+
+  float triAngleDeg = (float)orbitAngleDeg + 90.0f;
+  float rad = triAngleDeg * (float)M_PI / 180.0f;
+
+  float h = side * 0.86602540378f;
+
+  PtF topRelP   = {  0.0f,           -(2.0f/3.0f)*h };
+  PtF leftRelP  = { -side/2.0f,      +(1.0f/3.0f)*h };
+  PtF rightRelP = { +side/2.0f,      +(1.0f/3.0f)*h };
+  PtF notchRelP = {  0.0f,            0.0f }; // notchYOffset = 0
+
+  PtF topR   = rotRel(topRelP,   rad);
+  PtF leftR  = rotRel(leftRelP,  rad);
+  PtF rightR = rotRel(rightRelP, rad);
+  PtF notchR = rotRel(notchRelP, rad);
+
+  top   = { (int)lroundf(cx + topR.x),   (int)lroundf(cy + topR.y) };
+  left  = { (int)lroundf(cx + leftR.x),  (int)lroundf(cy + leftR.y) };
+  right = { (int)lroundf(cx + rightR.x), (int)lroundf(cy + rightR.y) };
+  notch = { (int)lroundf(cx + notchR.x), (int)lroundf(cy + notchR.y) };
+}
+
+void drawNotchedTriangle(const PtI &top, const PtI &left, const PtI &right, const PtI &notch,
+                         uint16_t fillColor, uint16_t outlineColor) {
+  tft.fillTriangle(top.x, top.y, left.x, left.y, notch.x, notch.y, fillColor);
+  tft.fillTriangle(top.x, top.y, notch.x, notch.y, right.x, right.y, fillColor);
+
+  tft.drawLine(top.x, top.y, left.x, left.y, outlineColor);
+  tft.drawLine(left.x, left.y, notch.x, notch.y, outlineColor);
+  tft.drawLine(notch.x, notch.y, right.x, right.y, outlineColor);
+  tft.drawLine(right.x, right.y, top.x, top.y, outlineColor);
+}
+
+void bboxOf(const PtI &a, const PtI &b, const PtI &c, const PtI &d,
+            int &x, int &y, int &w, int &h) {
+  int minX = min(min(a.x, b.x), min(c.x, d.x));
+  int maxX = max(max(a.x, b.x), max(c.x, d.x));
+  int minY = min(min(a.y, b.y), min(c.y, d.y));
+  int maxY = max(max(a.y, b.y), max(c.y, d.y));
+
+  x = minX;
+  y = minY;
+  w = (maxX - minX) + 1;
+  h = (maxY - minY) + 1;
+}
+
+bool clampRectToScreen(int &x, int &y, int &w, int &h) {
+  if (w <= 0 || h <= 0) return false;
+
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+
+  int maxW = tft.width()  - x;
+  int maxH = tft.height() - y;
+
+  if (w > maxW) w = maxW;
+  if (h > maxH) h = maxH;
+
+  return (w > 0 && h > 0);
+}
+

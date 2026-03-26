@@ -1,0 +1,62 @@
+
+[env:esp32dev]
+
+;platform = espressif32@6.9.0   ; Specify the version of the platform (or the latest one that worked)
+platform = espressif32@^6.12.0  ; TESTING NEW PLATFORM!!!!!!!
+
+
+platform_packages =
+  tool-esptoolpy@1.40501.0
+
+
+
+board = esp32dev
+framework = arduino
+upload_speed = 921600      ; try 460800 or 115200 if uploads get flaky
+monitor_speed = 115200     ; this is ONLY for the serial monitor
+board_build.filesystem = littlefs
+board_build.partitions = default.csv
+
+
+build_flags = 
+	-D USER_SETUP_LOADED
+	-D ILI9488_DRIVER
+
+	;Daniel's pins config
+	;-D TFT_CS=15
+	;//-D TFT_RST=2
+	;-D TFT_DC=0  ; ESP32U (with Antenna)
+	;//-D TFT_DC=5   ; ESP32 'Standard'
+	;//-D TFT_MOSI=23
+	;//-D TFT_SCLK=18
+	;//-D TFT_BLP=4 ; backlight pin , can also be connected directly to 5V
+	;//-D TOUCH_CS=22
+	;//-D TFT_MISO=19
+
+	;HB pins config
+
+	-D TFT_CS=23
+	-D TFT_RST=19
+	;//;-D TFT_DC=0  ; ESP32U (with Antenna)
+	-D TFT_DC=18   ; ESP32 'Standard'
+	-D TFT_MOSI=05
+	-D TFT_SCLK=15
+	-D TFT_BLP=17 ; backlight pin , can also be connected directly to 5V
+	-D TOUCH_CS=16
+	-D TFT_MISO=4
+	#-D TFT_INVERSION_ON  ;IPS used
+	-D TFT_INVERSION_OFF  ;IPS used
+
+	-D LOAD_GLCD=1     ; 8x6 basic fixed-width font (fastest, always available)
+	-D LOAD_FONT2      ; Small 16-pixel high sans serif font
+	-D LOAD_FONT4      ; Medium 26-pixel high sans serif bold font
+	;-D LOAD_FONT6      ; Large 48-pixel high numerals (digits only)
+	;-D LOAD_FONT7      ; Very large 75-pixel high numerals (digits only)
+	;-D LOAD_FONT8      ; Huge 100-pixel high numerals (digits only)
+	-D LOAD_GFXFF      ; Enable access to FreeFonts (stored in SPIFFS/PROGMEM)
+	
+	-D SPI_FREQUENCY=27000000
+	-D SPI_TOUCH_FREQUENCY=2500000
+	-D SPI_READ_FREQUENCY=16000000
+
+extra_scripts = ./HB9IIUfirmwareMaker.py

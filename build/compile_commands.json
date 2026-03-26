@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/Users/danielstaempfli/SynologyDrive/ZZ_GITHUB_NEW/ESP32-CYD-HamClock/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk -o CMakeFiles/Cpp20Tests.dir/smoke_test.o -c /Users/danielstaempfli/SynologyDrive/ZZ_GITHUB_NEW/ESP32-CYD-HamClock/lib/ArduinoJson-7.x/extras/tests/Cpp20/smoke_test.cpp",
+  "file": "/Users/danielstaempfli/SynologyDrive/ZZ_GITHUB_NEW/ESP32-CYD-HamClock/lib/ArduinoJson-7.x/extras/tests/Cpp20/smoke_test.cpp",
+  "output": "CMakeFiles/Cpp20Tests.dir/smoke_test.o"
+}
+]

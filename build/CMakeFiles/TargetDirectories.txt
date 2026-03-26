@@ -1,0 +1,3 @@
+/Users/danielstaempfli/SynologyDrive/ZZ_GITHUB_NEW/ESP32-CYD-HamClock/build/CMakeFiles/Cpp20Tests.dir
+/Users/danielstaempfli/SynologyDrive/ZZ_GITHUB_NEW/ESP32-CYD-HamClock/build/CMakeFiles/edit_cache.dir
+/Users/danielstaempfli/SynologyDrive/ZZ_GITHUB_NEW/ESP32-CYD-HamClock/build/CMakeFiles/rebuild_cache.dir
