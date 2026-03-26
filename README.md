@@ -24,6 +24,28 @@ In practice, this keeps the system behavior deterministic and easier to understa
 
 - **Hardware switching method:** antenna switching is not performed by directly selecting a relay matrix in this file. Instead, the committed antenna number is translated into a DTMF symbol and sent out through the HT9200 signaling path, which appears to control the downstream switching hardware.
 
+## Needle Background Restore — How It Works
+
+The needle is drawn on top of `greatcircleMap.png`. Every time the needle moves, the pixels it covered must be restored before drawing it at the new position.
+
+**Why not `tft.readRect()`?** The ILI9488 over SPI does not support pixel readback reliably — it returns garbage. Never use it.
+
+**Previous approach (RAM cache, removed):** At startup, the 267×267-pixel region of the map centred on the needle pivot (cx=240, cy=160) was decoded from the PNG and kept as a 68 KB heap buffer. This left no room for the SSL/TLS heap needed by MQTT over port 8883, limiting `NEEDLE_L` to 90.
+
+**Current approach (LittleFS raw file):** The same 267×267 region is pre-converted to a raw big-endian RGB565 binary file (`data/dialBg.raw`, 142 KB) using a Python script. At runtime the file stays open and needle restores are done by seeking to the correct row and reading only the dirty pixels into a 534-byte static buffer. This uses zero heap, leaving SSL free to operate, and allows `NEEDLE_L=130`.
+
+**Regenerating `dialBg.raw`** is required if you change the needle length, the pivot point, or the background image:
+
+```bash
+python3 tools/gen_dialBg_raw.py   # rewrites data/dialBg.raw
+pio run --target uploadfs -e daniel
+pio run --target upload -e daniel
+```
+
+The constants `NEEDLE_L`, `CACHE_R`, `CACHE_W`, `CX`, and `CY` must be identical in both `tools/gen_dialBg_raw.py` and `src/needleStuff.h`.
+
+**Flashing reminder:** `data/` (LittleFS) and the firmware are separate flash partitions. Any change to `data/` requires `uploadfs` in addition to `upload`.
+
 ## MQTT Explorer
 
 Download MQTT Explorer from https://mqtt-explorer.com/ and create a connection to the same broker used by the firmware.
@@ -36,6 +58,6 @@ Connect with these settings:
 - Set Port to 8883
 - Turn on TLS/SSL
 - Set Username to esp32-club
-- Set Password to the value from CLUB_STATION.cpp:85
+- Set Password to @V51bP9J@H
 - Set Client ID to something unique, for example daniel-mqtt-test
 - Click Connect

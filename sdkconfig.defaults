@@ -1,0 +1,6 @@
+# Reduce mbedTLS SSL record buffers to free heap for needle cache + MQTT
+# Default: 16384 in + 16384 out = 32 KB peak allocation at connect time
+# Here:     8192 in +  1024 out =  9 KB — saves ~23 KB heap
+# 8 KB input is sufficient for HiveMQ Cloud certificate chain + MQTT traffic
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=1024
