@@ -24,7 +24,6 @@
 //  Connectivity & Services
 //   - WiFi provisioning via HB9IIUPortal (AP name: HB9IIUPortal / beverage).
 //   - Secure MQTT via HiveMQ Cloud over TLS (port 8883).
-//   - ElegantOTA firmware updates served via WebServer (port 80).
 //   - SNTP time sync (UTC + local TZ for display).
 //
 //  MQTT Topics (CLUB role)
@@ -56,12 +55,11 @@
 #include <PNGdec.h>
 #include <Preferences.h>
 #include "nvs_flash.h"
-#include <ElegantOTA.h>
-#include <WebServer.h>
 #include <time.h>
 #include <lwip/apps/sntp.h>
 #include <Wire.h>
 #include "PCF8574.h" // Rob Tillaart PCF8574 library
+#include "needleStuff.h"
 
 #define TFT_RGB_ORDER TFT_BGR
 // tft.invertDISPLAY(true);
@@ -98,18 +96,16 @@ const char *MQTT_TOPIC_STATE = "antenna/state";
 const char *MQTT_TOPIC_CMD = "antenna/cmd";
 const char *MQTT_TOPIC_HEARTBEAT = "antenna/heartbeat";
 
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000; // publish alive every 5 s
+
 // REMOTE interaction tracking (CLUB-side)
 unsigned long lastRemoteInteractionMs = 0;
-const unsigned long REMOTE_ACTIVE_MS = 5000; // 30 s window
+const unsigned long REMOTE_ACTIVE_MS = 5000; // 5 s window
+
+unsigned long gSetupDoneMs = 0; // stamped at end of setup(); buttons blocked for 1 s after
 
 WiFiClientSecure mqttSecureClient;
 PubSubClient mqttClient(mqttSecureClient);
-
-// ============================================================================
-//                               OTA (ElegantOTA) SERVER
-// ============================================================================
-
-WebServer otaServer(80);
 
 // ============================================================================
 //                         GLOBAL DISPLAY / APP VARIABLES
@@ -153,8 +149,11 @@ int pulseDirection = -15;
 
 // Encoder state
 int8_t encoderAccum = 0;
-uint8_t lastState = 0;
 const int STEPS_PER_NOTCH = 4;
+
+// ISR-side encoder state (written only from ISR)
+volatile uint8_t encISRlastState = 0;
+volatile int16_t encISRcount = 0;
 
 // Encoder lookup table
 const int8_t encTable[16] = {
@@ -165,9 +164,6 @@ const int8_t encTable[16] = {
 
 // Pending selection
 uint8_t pendingAntenna = 0;
-unsigned long lastEncoderMoveMs = 0;
-bool pendingSelection = false;
-const unsigned long SELECTION_DELAY_MS = 300;
 
 // Antenna limits
 uint8_t selectedAntenna = 1;
@@ -205,9 +201,6 @@ bool mqttEnsureConnected();
 void mqttCallback(char *topic, byte *payload, unsigned int length);
 void publishSelectCommand();
 
-// OTA
-void setupElegantOTA();
-
 // TFT / Filesystem
 // void displayPicture(const char *imageName, int duration_ms);
 // void mountAndListSPIFFS(uint8_t levels = 255, bool listContent = true);
@@ -215,6 +208,7 @@ void initAntennaDial();
 void initEncoderPins();
 
 // Encoder / Button
+void IRAM_ATTR encISR();
 void updateEncoder();
 void updateButton();
 
@@ -256,7 +250,6 @@ void encodertestTFT();
 
 void mountAndListFiles();
 
-bool otaActive = false;
 bool waitForTimeVerbose(uint32_t timeoutMs = 15000);
 void printTimes();
 void drawLocalAndUTCTime(int16_t y, int16_t margin);
@@ -293,8 +286,7 @@ uint16_t VERY_LIGHT_GREY = tft.color565(230, 230, 230); // tweak 220–245 to ta
 
 void stepAntennaByButtons(int dir);
 void updateModeSelectButton();
-void onExtraLeftPressed();
-void onExtraRightPressed();
+void onExtraButtonPressed(bool isLeft);
 void drawModeIndicator(bool force = false);
 void loadPresetsFromNVS();
 void savePresetToNVS(bool isLeftSlot, uint8_t antenna);
@@ -421,30 +413,28 @@ void updateModeSelectButton()
     }
 }
 
-void onExtraLeftPressed()
+void onExtraButtonPressed(bool isLeft)
 {
-    // MODE A: step CCW
+    // MODE A: step CW (right) or CCW (left)
     if (gMode == MODE_A)
     {
-        stepAntennaByButtons(-1);
+        stepAntennaByButtons(isLeft ? -1 : +1);
         return;
     }
 
-    // MODE B:
+    // MODE B: save armed — store into the pressed slot
     if (presetSaveArmed)
     {
-        // Save current antenna into LEFT slot
-        savePresetToNVS(true, selectedAntenna);
-
+        savePresetToNVS(isLeft, selectedAntenna);
         presetSaveArmed = false;
-        Serial.println("[UI ] Preset SAVE disarmed (stored LEFT)");
+        Serial.printf("[UI ] Preset SAVE disarmed (stored %s)\n", isLeft ? "LEFT" : "RIGHT");
         return;
     }
 
-    // Normal recall
-    Serial.printf("[BTN] Recall LEFT preset -> antenna %u\n", presetLeft);
+    // MODE B: normal recall
+    uint8_t target = isLeft ? presetLeft : presetRight;
+    Serial.printf("[BTN] Recall %s preset -> antenna %u\n", isLeft ? "LEFT" : "RIGHT", target);
 
-    uint8_t target = presetLeft;
     if (target >= ANTENNA_MIN && target <= ANTENNA_MAX && target != selectedAntenna)
     {
         if (switchAntenna(target))
@@ -453,44 +443,7 @@ void onExtraLeftPressed()
             preSelectedAntenna = target;
             updateDialColors();
             updateDynamicCornerLabels();
-            publishAntennaState("preset_left");
-        }
-    }
-}
-
-void onExtraRightPressed()
-{
-    // MODE A: step CW
-    if (gMode == MODE_A)
-    {
-        stepAntennaByButtons(+1);
-        return;
-    }
-
-    // MODE B:
-    if (presetSaveArmed)
-    {
-        // Save current antenna into RIGHT slot
-        savePresetToNVS(false, selectedAntenna);
-
-        presetSaveArmed = false;
-        Serial.println("[UI ] Preset SAVE disarmed (stored RIGHT)");
-        return;
-    }
-
-    // Normal recall
-    Serial.printf("[BTN] Recall RIGHT preset -> antenna %u\n", presetRight);
-
-    uint8_t target = presetRight;
-    if (target >= ANTENNA_MIN && target <= ANTENNA_MAX && target != selectedAntenna)
-    {
-        if (switchAntenna(target))
-        {
-            selectedAntenna = target;
-            preSelectedAntenna = target;
-            updateDialColors();
-            updateDynamicCornerLabels();
-            publishAntennaState("preset_right");
+            publishAntennaState(isLeft ? "preset_left" : "preset_right");
         }
     }
 }
@@ -498,6 +451,8 @@ void onExtraRightPressed()
 // Active-low buttons with EXTERNAL pull-ups
 void updateExtraButtons()
 {
+    if (gSetupDoneMs == 0 || (millis() - gSetupDoneMs) < 1000) return; // ignore during startup RF noise (GPIO34/35 have no internal pull-ups)
+
     int l = digitalRead(PIN_PBL); // GPIO34
     int r = digitalRead(PIN_PBR); // GPIO35
 
@@ -516,7 +471,7 @@ void updateExtraButtons()
         {
             lStable = l;
             if (lStable == LOW)
-                onExtraLeftPressed();
+                onExtraButtonPressed(true);
         }
 
         // RIGHT edge (trigger on press -> LOW)
@@ -524,7 +479,7 @@ void updateExtraButtons()
         {
             rStable = r;
             if (rStable == LOW)
-                onExtraRightPressed();
+                onExtraButtonPressed(false);
         }
     }
 }
@@ -1113,9 +1068,6 @@ void keypadTick()
     }
 }
 
-// Added Februar 2025
-#include "needleStuff.h"
-
 int lastNeedleIndex=0;
 
 // ============================================================================
@@ -1130,7 +1082,11 @@ void setup()
 
     displayIntroBanner(); // Visual + serial intro banner
     printSystemInfo();    // CPU, memory, flash, PSRAM summary
+
     mountAndListFiles();  // LittleFS mount + file listing
+
+    // Open dialBg.raw for needle background restores (no heap allocation needed)
+    initNeedleCache(240, 160);
 
     // ──────────────────────────────────────────────
     // 2️⃣  hardware initialization
@@ -1228,7 +1184,6 @@ void setup()
         // Network services
         mqttSetup(); // Secure MQTT client
         publishAntennaState("boot");
-        setupElegantOTA(); // OTA web server
 
         // Time synchronization (SNTP)
         waitForTimeVerbose();
@@ -1247,6 +1202,7 @@ void setup()
 
         //drawNeedle(240, 160, 0);
 
+        gSetupDoneMs = millis();
         Serial.println(F("✅ Setup complete.\n"));
     }
 
@@ -1331,17 +1287,6 @@ void loop()
     // ──────────────────────────────────────────────
     if (HB9IIUPortal::isConnected())
     {
-        // OTA servicing (always)
-        otaServer.handleClient();
-        ElegantOTA.loop();
-
-        // During OTA, suspend everything else
-        if (otaActive)
-        {
-            delay(5);
-            return;
-        }
-
         // MQTT keep-alive
         mqttClient.loop();
 
@@ -1357,14 +1302,10 @@ void loop()
 
         // ──────────────────────────────────────────────
         // 2a) High-priority physical inputs
-        //     (disable antenna UI inputs while KEYPAD view is active)
         // ──────────────────────────────────────────────
-        if (gView != VIEW_KEYPAD)
-        {
-            updateModeSelectButton();
-            updateExtraButtons();
-            updateEncoder(); // only ONCE per loop
-        }
+        updateModeSelectButton();
+        updateExtraButtons();
+        updateEncoder(); // only ONCE per loop
 
         // ──────────────────────────────────────────
         // Antenna pulse animation (dial view only)
@@ -1407,6 +1348,16 @@ void loop()
         {
             drawWiFiIndicator();
             lastRssi = rssi;
+        }
+
+        // ──────────────────────────────────────────
+        // Heartbeat publish (always, not idle-only)
+        // ──────────────────────────────────────────
+        static unsigned long lastHeartbeat = 0;
+        if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS)
+        {
+            lastHeartbeat = millis();
+            publishHeartbeat();
         }
 
         // ──────────────────────────────────────────
@@ -1459,12 +1410,11 @@ Serial.println("Touch detected at (" + String(x) + ", " + String(y) + ")");
                     unsigned long now = millis();
 
                     // ignore if pressed again too soon
-                    if (now - lastTRXSDRTouchMs < TRX_SDR_DEBOUNCE_MS)
-                        return;
-
-                    lastTRXSDRTouchMs = now;
-
-                    onTRX_SDRButtonPressed();
+                    if (now - lastTRXSDRTouchMs >= TRX_SDR_DEBOUNCE_MS)
+                    {
+                        lastTRXSDRTouchMs = now;
+                        onTRX_SDRButtonPressed();
+                    }
                     return;
                 }
 
@@ -1609,6 +1559,13 @@ void publishAntennaState(const char *reason)
     Serial.println(F(")"));
 }
 
+void publishHeartbeat()
+{
+    if (!mqttClient.connected())
+        return;
+    mqttClient.publish(MQTT_TOPIC_HEARTBEAT, "ok"); // non-retained
+}
+
 // Incoming MQTT messages (state + heartbeat from club)
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
@@ -1690,6 +1647,7 @@ void initAntennaDial()
 {
     Serial.println(F("[INIT] Antenna dial"));
 
+    needleInvalidate(); // screen is being fully redrawn — no previous needle to restore
     loadDotConfig();
     ANTENNA_MAX = numDots;
 
@@ -1698,6 +1656,7 @@ void initAntennaDial()
 
     // IMPORTANT: do NOT reset selectedAntenna / preSelectedAntenna here.
     // We want to keep whatever state we currently have from CLUB/REMOTE.
+    lastNeedleIndex = -1; // force needle redraw on next updateDialColors()
     updateDialColors();
 
     updateDynamicCornerLabels();
@@ -1715,7 +1674,7 @@ void initEncoderPins()
     int dt = digitalRead(PIN_ENC_DT);
     int clk = digitalRead(PIN_ENC_CLK);
     int sw = digitalRead(PIN_ENC_SW);
-    lastState = (dt << 1) | clk;
+    encISRlastState = (uint8_t)((dt << 1) | clk);
 
     // --- Explain each line clearly ---
     Serial.println(F("GPIO configuration and idle signal state:"));
@@ -1727,10 +1686,15 @@ void initEncoderPins()
                   PIN_ENC_SW, sw, sw ? "released (HIGH)" : "pressed (LOW)");
 
     Serial.println();
-    Serial.printf("   ↳ Initial encoder state: 0b%02d (DT=%d, CLK=%d)\n", lastState, dt, clk);
+    Serial.printf("   ↳ Initial encoder state: 0b%02d (DT=%d, CLK=%d)\n", encISRlastState, dt, clk);
     Serial.println();
     Serial.println(F("   ✅ Encoder GPIOs all configured as inputs."));
     Serial.println(F("   Encoder lines read HIGH → mechanical contacts are open (idle state)."));
+
+    // Attach interrupts — captures every edge even when loop() is busy
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_DT),  encISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), encISR, CHANGE);
+    Serial.println(F("   ✅ Encoder interrupts attached (DT + CLK)."));
     Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));
     Serial.println();
 }
@@ -1791,19 +1755,6 @@ void drawAntennaDot(uint8_t index, uint16_t color)
 
     tft.fillCircle(dotX[index], dotY[index], DIAL_DOT_RADIUS, color);
     tft.drawCircle(dotX[index], dotY[index], DIAL_DOT_RADIUS + 1, TFT_WHITE);
-
-
-
-    if (lastNeedleIndex!=index && color == TftRed)
-    {
-
-        drawNeedle(240, 160, dotAzimuthDeg[index]);
-        lastNeedleIndex=index;
-
-   
-    }
-
-
 }
 
 void drawDialBase()
@@ -1825,6 +1776,12 @@ void updateDialColors()
             color = TftRed;
 
         drawAntennaDot(i, color);
+    }
+
+    if (lastNeedleIndex != (int)selectedAntenna)
+    {
+        drawNeedle(240, 160, dotAzimuthDeg[selectedAntenna]);
+        lastNeedleIndex = selectedAntenna;
     }
 }
 
@@ -1862,82 +1819,70 @@ void updateDialColors()
 // lightweight and deterministic.
 // ============================================================================
 
+// ── Encoder ISR ─────────────────────────────────────────────────────────────
+// Runs on every CHANGE of DT or CLK — captures edges regardless of loop() load.
+void IRAM_ATTR encISR()
+{
+    uint8_t cur = (uint8_t)((digitalRead(PIN_ENC_DT) << 1) | digitalRead(PIN_ENC_CLK));
+    encISRcount += encTable[(encISRlastState << 2) | cur];
+    encISRlastState = cur;
+}
+
 void updateEncoder()
 {
-    int dt = digitalRead(PIN_ENC_DT);
-    int clk = digitalRead(PIN_ENC_CLK);
-    uint8_t currentState = (dt << 1) | clk;
+    // ── 1) Atomically snapshot and clear ISR counter ─────────────────────────
+    portDISABLE_INTERRUPTS();
+    int16_t delta = encISRcount;
+    encISRcount = 0;
+    portENABLE_INTERRUPTS();
 
-    uint8_t index = (lastState << 2) | currentState;
-    int8_t movement = encTable[index];
+    // ── 2) Process ALL accumulated detents in one call ───────────────────────
+    bool anyDetent = false;
 
-    bool detent = false;
-
-    if (movement != 0)
+    if (delta != 0)
     {
-        encoderAccum += movement;
-        lastState = currentState;
+        encoderAccum += delta;
 
-        if (encoderAccum >= STEPS_PER_NOTCH)
+        while (encoderAccum >= STEPS_PER_NOTCH || encoderAccum <= -STEPS_PER_NOTCH)
         {
-            encoderAccum = 0;
-            detent = true;
+            bool cw;
+            if (encoderAccum >= STEPS_PER_NOTCH)
+            {
+                encoderAccum -= STEPS_PER_NOTCH;
+                cw = true;
+            }
+            else
+            {
+                encoderAccum += STEPS_PER_NOTCH;
+                cw = false;
+            }
 
-            // Exit map on first detent (unchanged)
+            // Exit map: consume remaining accumulated detents and return
             if (gView == VIEW_MAP)
             {
+                encoderAccum = 0;
                 gView = VIEW_DIAL;
                 displayImageOnTFT(png, "greatcircleMap.png");
                 initAntennaDial();
-                drawModeIndicator(true); // FORCE
+                drawModeIndicator(true);
                 updateDynamicCornerLabels(true);
                 drawLocalAndUTCTime(240, 10);
                 return;
             }
 
-            // Start preview session if not active
             if (previewAntenna == 0)
                 previewAntenna = selectedAntenna;
 
-            // CW
-            previewAntenna =
-                (previewAntenna >= ANTENNA_MAX) ? ANTENNA_MIN : (previewAntenna + 1);
-        }
-        else if (encoderAccum <= -STEPS_PER_NOTCH)
-        {
-            encoderAccum = 0;
-            detent = true;
+            previewAntenna = cw
+                ? ((previewAntenna >= ANTENNA_MAX) ? ANTENNA_MIN : (previewAntenna + 1))
+                : ((previewAntenna <= ANTENNA_MIN) ? ANTENNA_MAX : (previewAntenna - 1));
 
-            // Exit map on first detent (unchanged)
-            if (gView == VIEW_MAP)
-            {
-                gView = VIEW_DIAL;
-                displayImageOnTFT(png, "greatcircleMap.png");
-                initAntennaDial();
-                drawModeIndicator(true); // FORCE
-                updateDynamicCornerLabels(true);
-                drawLocalAndUTCTime(240, 10);
-                return;
-            }
-
-            // Start preview session if not active
-            if (previewAntenna == 0)
-                previewAntenna = selectedAntenna;
-
-            // CCW
-            previewAntenna =
-                (previewAntenna <= ANTENNA_MIN) ? ANTENNA_MAX : (previewAntenna - 1);
+            anyDetent = true;
         }
     }
-    else
-    {
-        lastState = currentState;
-    }
 
-    // ──────────────────────────────────────────────
-    // Preview redraw
-    // ──────────────────────────────────────────────
-    if (detent)
+    // ── 3) Redraw once after all detents processed ───────────────────────────
+    if (anyDetent)
     {
         lastUserInteractionMs = millis();
         lastEncoderActivityMs = millis();
@@ -1947,19 +1892,21 @@ void updateEncoder()
             if (i == selectedAntenna)
                 drawAntennaDot(i, TftGreen);
             else if (i == previewAntenna)
-            {
-
                 drawAntennaDot(i, TftYellow);
-            }
             else
                 drawAntennaDot(i, TftGrey);
         }
+
+        if (lastNeedleIndex != (int)previewAntenna)
+        {
+            drawNeedle(240, 160, dotAzimuthDeg[previewAntenna]);
+            lastNeedleIndex = previewAntenna;
+        }
+
         Serial.printf("[UI ] Preview antenna %u\n", previewAntenna);
     }
 
-    // ──────────────────────────────────────────────
-    // Commit after settle time
-    // ──────────────────────────────────────────────
+    // ── 4) Commit after settle time ──────────────────────────────────────────
     if (previewAntenna != 0 &&
         (millis() - lastEncoderActivityMs) > PREVIEW_SETTLE_MS)
     {
@@ -1979,7 +1926,6 @@ void updateEncoder()
             }
         }
 
-        // End preview session
         previewAntenna = 0;
     }
 }
@@ -2039,7 +1985,6 @@ void updateDynamicCornerLabels(bool force)
     // --- Label font ---
     tft.setTextFont(2);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextColor(VERY_LIGHT_GREY, TFT_BLACK);
     tft.setFreeFont(&RobotoMono_Light8pt7b);
 
@@ -2317,29 +2262,6 @@ void performFactoryResetAll()
     ESP.restart(); // does not return
 }
 
-void setupElegantOTA()
-{
-    // HB9IIUPortal already connected WiFi.
-
-    otaServer.on("/", []()
-                 {
-                    Serial.println(F("[OTA] Redirecting to /update"));
-                     otaActive = true; // OTA upload really starts HERE
-
-                     otaServer.sendHeader("Location", "/update", true);
-                     otaServer.send(302, "text/plain", ""); });
-    otaServer.on(
-        "/update",
-        HTTP_POST,
-        []() {},              // final response handled by ElegantOTA
-        []() {                // upload handler
-            otaActive = true; // OTA upload really starts HERE
-        });
-    ElegantOTA.begin(&otaServer); // inject /update routes
-    otaServer.begin();
-
-    Serial.println(F("[OTA] ElegantOTA started on http://contest.local/update"));
-}
 void checkAndApplyTFTCalibrationData(bool recalibrate)
 {
     Serial.println(F("───────────────────────────────────────────────────────────────────────────────"));

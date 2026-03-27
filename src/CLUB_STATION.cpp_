@@ -96,11 +96,13 @@ const char *MQTT_TOPIC_STATE = "antenna/state";
 const char *MQTT_TOPIC_CMD = "antenna/cmd";
 const char *MQTT_TOPIC_HEARTBEAT = "antenna/heartbeat";
 
+const unsigned long HEARTBEAT_INTERVAL_MS = 5000; // publish alive every 5 s
+
 // REMOTE interaction tracking (CLUB-side)
 unsigned long lastRemoteInteractionMs = 0;
 const unsigned long REMOTE_ACTIVE_MS = 5000; // 5 s window
 
-unsigned long gSetupDoneMs = 0; // stamped at end of setup(); buttons blocked for 2 s after
+unsigned long gSetupDoneMs = 0; // stamped at end of setup(); buttons blocked for 1 s after
 
 WiFiClientSecure mqttSecureClient;
 PubSubClient mqttClient(mqttSecureClient);
@@ -198,6 +200,7 @@ void mqttSetup();
 bool mqttEnsureConnected();
 void mqttCallback(char *topic, byte *payload, unsigned int length);
 void publishSelectCommand();
+void publishHeartbeat();
 
 // TFT / Filesystem
 // void displayPicture(const char *imageName, int duration_ms);
@@ -449,7 +452,7 @@ void onExtraButtonPressed(bool isLeft)
 // Active-low buttons with EXTERNAL pull-ups
 void updateExtraButtons()
 {
-    if (gSetupDoneMs == 0 || (millis() - gSetupDoneMs) < 2000) return; // ignore during startup RF noise (GPIO34/35 have no internal pull-ups)
+    if (gSetupDoneMs == 0 || (millis() - gSetupDoneMs) < 1000) return; // ignore during startup RF noise (GPIO34/35 have no internal pull-ups)
 
     int l = digitalRead(PIN_PBL); // GPIO34
     int r = digitalRead(PIN_PBR); // GPIO35
@@ -1349,6 +1352,16 @@ void loop()
         }
 
         // ──────────────────────────────────────────
+        // Heartbeat publish (always, not idle-only)
+        // ──────────────────────────────────────────
+        static unsigned long lastHeartbeat = 0;
+        if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS)
+        {
+            lastHeartbeat = millis();
+            publishHeartbeat();
+        }
+
+        // ──────────────────────────────────────────
         // MQTT status indicator (idle-only)
         // ──────────────────────────────────────────
         static unsigned long lastMQTTDraw = 0;
@@ -1545,6 +1558,13 @@ void publishAntennaState(const char *reason)
     Serial.print(F("  (retained="));
     Serial.print(ok ? F("OK") : F("FAIL"));
     Serial.println(F(")"));
+}
+
+void publishHeartbeat()
+{
+    if (!mqttClient.connected())
+        return;
+    mqttClient.publish(MQTT_TOPIC_HEARTBEAT, "ok"); // non-retained
 }
 
 // Incoming MQTT messages (state + heartbeat from club)
