@@ -2,27 +2,67 @@
 
 ## Summary
 
-This project is organized around a clear controller model for the beverage antenna system. The clubhouse station is intended to be the central authority that manages the actual antenna state, while remote panels provide a convenient way to request changes from other locations.
+This project implements a two-station antenna controller for a beverage antenna system.
 
-That means remotes do not become the source of truth. They only ask. The club station decides and reports the real result.
+- **CLUB station** (`src/CLUB_STATION.cpp`) is the authoritative controller. It manages physical antenna switching, drives the DTMF encoder and relay outputs, and publishes the confirmed state over MQTT.
+- **REMOTE station** (`src/REMOTE_STATION.cpp`) is a UI client. It sends selection requests to CLUB via MQTT and renders the CLUB-confirmed state on its own TFT display.
 
-In practice, this keeps the system behavior deterministic and easier to understand: local and remote actions both flow into the same controller, and the club station publishes the authoritative state that the rest of the system can trust.
+Remotes do not become the source of truth — they only request. CLUB decides and reports the real result. This keeps behaviour deterministic: local and remote actions both flow into the same controller.
+
+## Building
+
+Only one station file can be active at a time (both define `setup()` and `loop()`). To select which station to build, rename the inactive file with a trailing underscore to exclude it from compilation:
+
+```
+# Build CLUB:
+src/CLUB_STATION.cpp       ← active
+src/REMOTE_STATION.cpp_    ← disabled
+
+# Build REMOTE:
+src/CLUB_STATION.cpp_      ← disabled
+src/REMOTE_STATION.cpp     ← active
+```
+
+Select the target hardware environment in `platformio.ini`:
+```ini
+default_envs = daniel   ; or henryk
+```
 
 ## Notes
 
-- **WiFi connection and callsign acquisition:** on boot, the firmware first tries to load saved WiFi credentials from NVS (Non-Volatile Storage) through HB9IIUPortal. If valid credentials are already stored, it connects directly to the configured network and then loads the station callsign from NVS for use as the panel or station identifier. If no valid credentials are available, the device starts the captive portal, where the user selects the WiFi network, enters the password, and provides the callsign; once validated, all of that information is saved and used on the next boot.
+- **WiFi connection and callsign acquisition:** on boot, the firmware tries to load saved WiFi credentials from NVS through HB9IIUPortal. If valid credentials are stored, it connects directly. Otherwise it starts a captive portal where the user enters WiFi credentials and callsign, which are then saved for subsequent boots.
 
-- **Factory reset behavior:** if the encoder push button is held during boot, the firmware performs a full NVS erase and restarts. This clears stored WiFi credentials, callsign and configuration data, presets, and other saved preferences, forcing the device back into first-time setup behavior.
+- **Factory reset:** holding the encoder push button during boot performs a full NVS erase and restarts, clearing all stored credentials, callsign, presets, and configuration.
 
-- **Antenna selection workflow:** the clubhouse station is the authoritative controller for antenna state. Local encoder movement enters a preview phase on the dial, and the actual antenna change is only committed after rotation stops for a short settle interval. At commit time, the firmware executes the physical switching command and publishes the new antenna state over MQTT.
+- **Antenna selection workflow (CLUB):** encoder rotation enters a preview phase on the dial. The actual antenna change is only committed after rotation stops for `PREVIEW_SETTLE_MS`. At commit time, the firmware executes the physical switch and publishes the new state over MQTT.
 
-- **MQTT role and topics:** the clubhouse station subscribes to antenna/cmd for incoming remote selection requests and publishes the authoritative retained state on antenna/state. This allows remote panels to request a change while the clubhouse station remains the single source of truth for the selected antenna.
+- **Antenna selection workflow (REMOTE):** encoder rotation updates the local preview needle immediately. After `PREVIEW_SETTLE_MS` of inactivity, a SELECT command is published to CLUB via MQTT. The needle stays at preview position until CLUB confirms. Commit is blocked if CLUB is offline.
 
-- **User interface structure:** the touchscreen firmware provides three main views: the antenna dial, a great-circle map view, and a keypad or relay page. The dial is the primary control surface, the map visualizes the currently selected azimuth from the configured home location, and the keypad page drives relay outputs through the PCF8574 expander.
+- **MQTT topics:**
 
-- **Local control modes and presets:** in addition to the rotary encoder, the firmware supports left and right hardware buttons with two operating modes. Mode A provides direct antenna stepping, while Mode B provides preset recall and preset saving after a long-press arm action on the encoder button.
+  | Topic | Direction | Description |
+  |---|---|---|
+  | `antenna/state` | CLUB → REMOTE | Authoritative retained state |
+  | `antenna/cmd` | REMOTE → CLUB | Selection requests |
+  | `antenna/heartbeat` | CLUB → REMOTE | Presence beacon, every 5 s, non-retained |
 
-- **Hardware switching method:** antenna switching is not performed by directly selecting a relay matrix in this file. Instead, the committed antenna number is translated into a DTMF symbol and sent out through the HT9200 signaling path, which appears to control the downstream switching hardware.
+- **REMOTE MQTT LED indicator** (bottom-right corner of TFT):
+
+  | Colour | Pattern | Meaning |
+  |---|---|---|
+  | Red | Solid | No WiFi |
+  | Red | Blinking | WiFi ok, MQTT broker unreachable |
+  | Orange | Solid | MQTT ok, CLUB offline (no heartbeat for 15 s) |
+  | Green | Solid | MQTT ok, CLUB alive, idle |
+  | Yellow | Blinking | Awaiting CLUB confirmation |
+
+- **Troubleshooting — racing commits:** if fast rotation causes multiple SELECT commands and relay/DTMF chatter, increase `PREVIEW_SETTLE_MS` in `REMOTE_STATION.cpp` (default 500 ms). This forces the user to pause longer before a commit is sent.
+
+- **User interface:** three views are available — antenna dial (primary control), great-circle map (visualises azimuth from home QTH), and a keypad/relay page (drives PCF8574 outputs). Views are toggled by touching the screen.
+
+- **Local control modes and presets:** the left and right hardware buttons operate in two modes. Mode A steps the antenna CW/CCW. Mode B recalls presets, with long-press on the encoder button to arm a preset save.
+
+- **Hardware switching (CLUB only):** the committed antenna number is translated into a DTMF symbol sent via the HT9200A, which controls the downstream switching hardware. The SDR/TRX relay is driven directly from a GPIO pin. Additional relay outputs are driven via a PCF8574 I2C expander.
 
 ## Needle Background Restore — How It Works
 
