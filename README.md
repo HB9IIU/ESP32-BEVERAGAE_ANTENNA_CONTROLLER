@@ -11,22 +11,16 @@ Remotes do not become the source of truth — they only request. CLUB decides an
 
 ## Building
 
-Only one station file can be active at a time (both define `setup()` and `loop()`). To select which station to build, rename the inactive file with a trailing underscore to exclude it from compilation:
+Both source files always exist. Select the target in `platformio.ini`:
 
-```
-# Build CLUB:
-src/CLUB_STATION.cpp       ← active
-src/REMOTE_STATION.cpp_    ← disabled
-
-# Build REMOTE:
-src/CLUB_STATION.cpp_      ← disabled
-src/REMOTE_STATION.cpp     ← active
-```
-
-Select the target hardware environment in `platformio.ini`:
 ```ini
-default_envs = daniel   ; or henryk
+default_envs = daniel-club    ; Daniel's hardware, CLUB role
+default_envs = daniel-remote  ; Daniel's hardware, REMOTE role
+default_envs = henryk-club    ; Henryk's hardware, CLUB role
+default_envs = henryk-remote  ; Henryk's hardware, REMOTE role
 ```
+
+`build_src_filter` in each environment ensures only the correct `.cpp` is compiled — no file renaming needed.
 
 ## Notes
 
