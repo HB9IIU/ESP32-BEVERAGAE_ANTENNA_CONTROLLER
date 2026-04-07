@@ -293,7 +293,7 @@ uint16_t VERY_LIGHT_GREY = tft.color565(230, 230, 230); // tweak 220–245 to ta
 
 void stepAntennaByButtons(int dir);
 void updateModeSelectButton();
-void onExtraButtonPressed(bool isLeft, bool isLong);
+void onExtraButtonPressed(bool isLeft);
 void drawModeIndicator(bool force = false);
 void loadPresetsFromNVS();
 void savePresetToNVS(bool isLeftSlot, uint8_t antenna);
@@ -312,8 +312,11 @@ const unsigned long BUTTON_DEBOUNCE_MS = 35;
 static unsigned long lastTRXSDRTouchMs = 0;
 static const unsigned long TRX_SDR_DEBOUNCE_MS = 350; // increase this (e.g. 250..600)
 
-const unsigned long MODE_LONGPRESS_MS   = 1200; // long press on encoder button (GPIO25)
-const unsigned long BUTTON_LONGPRESS_MS =  800; // long press on side buttons (PBL/PBR)
+const unsigned long MODE_LONGPRESS_MS    = 1200; // long press on GPIO25
+const unsigned long PRESET_ARM_WINDOW_MS = 5000; // save window duration
+
+bool presetSaveArmed = false;
+unsigned long presetSaveArmUntilMs = 0;
 
 // -----------------------------------------------------------------------------
 // Extra buttons (GPIO34/35) debounce state (active-low with external pull-ups)
@@ -384,9 +387,21 @@ void updateModeSelectButton()
 
             unsigned long heldMs = millis() - pressStartMs;
 
-            // LONG PRESS -> ignored
+            // LONG PRESS -> ARM SAVE (only meaningful in Mode B)
             if (heldMs >= MODE_LONGPRESS_MS)
+            {
+                if (gMode == MODE_B)
+                {
+                    presetSaveArmed = true;
+                    presetSaveArmUntilMs = millis() + PRESET_ARM_WINDOW_MS;
+                    Serial.println("[UI ] Preset SAVE ARMED (5s) - press LEFT/RIGHT to store");
+                }
+                else
+                {
+                    Serial.println("[UI ] Long press ignored (not in Mode B)");
+                }
                 return;
+            }
 
             // SHORT PRESS -> TOGGLE MODE
             gMode = (gMode == MODE_A) ? MODE_B : MODE_A;
@@ -394,27 +409,34 @@ void updateModeSelectButton()
             drawModeIndicator(true); // FORCE
         }
     }
+
+    // Optional: auto-expire arming flag (kept here so it runs frequently)
+    if (presetSaveArmed && (millis() > presetSaveArmUntilMs))
+    {
+        presetSaveArmed = false;
+        Serial.println("[UI ] Preset SAVE disarmed (timeout)");
+    }
 }
 
-void onExtraButtonPressed(bool isLeft, bool isLong)
+void onExtraButtonPressed(bool isLeft)
 {
-    // Mode A: step antenna (short or long, same action)
+    // MODE A: step CW (right) or CCW (left)
     if (gMode == MODE_A)
     {
         stepAntennaByButtons(isLeft ? -1 : +1);
         return;
     }
 
-    // Mode B: long press → save current antenna to NVS
-    if (isLong)
+    // MODE B: save armed — store into the pressed slot
+    if (presetSaveArmed)
     {
-        Serial.printf("[BTN] Long press: saving %s preset = %u\n",
-                      isLeft ? "LEFT" : "RIGHT", selectedAntenna);
         savePresetToNVS(isLeft, selectedAntenna);
+        presetSaveArmed = false;
+        Serial.printf("[UI ] Preset SAVE disarmed (stored %s)\n", isLeft ? "LEFT" : "RIGHT");
         return;
     }
 
-    // Mode B: short press → recall preset
+    // MODE B: normal recall
     uint8_t target = isLeft ? presetLeft : presetRight;
     Serial.printf("[BTN] Recall %s preset -> antenna %u\n", isLeft ? "LEFT" : "RIGHT", target);
 
@@ -431,43 +453,39 @@ void onExtraButtonPressed(bool isLeft, bool isLong)
     }
 }
 
-// Active-low buttons with EXTERNAL pull-ups — fires on release, detects short/long
+// Active-low buttons with EXTERNAL pull-ups
 void updateExtraButtons()
 {
-    if (gSetupDoneMs == 0 || (millis() - gSetupDoneMs) < 1000) return;
+    if (gSetupDoneMs == 0 || (millis() - gSetupDoneMs) < 1000) return; // ignore during startup RF noise (GPIO34/35 have no internal pull-ups)
 
-    static bool          lPressed      = false;
-    static bool          rPressed      = false;
-    static unsigned long lPressStartMs = 0;
-    static unsigned long rPressStartMs = 0;
+    int l = digitalRead(PIN_PBL); // GPIO34
+    int r = digitalRead(PIN_PBR); // GPIO35
 
-    int l = digitalRead(PIN_PBL);
-    int r = digitalRead(PIN_PBR);
-
+    // debounce timing if either changed
     if (l != lastLsample || r != lastRsample)
     {
         lrLastChangeMs = millis();
-        lastLsample    = l;
-        lastRsample    = r;
+        lastLsample = l;
+        lastRsample = r;
     }
 
-    if ((millis() - lrLastChangeMs) <= BUTTON_DEBOUNCE_MS)
-        return;
-
-    // LEFT button
-    if (l != lStable)
+    if ((millis() - lrLastChangeMs) > BUTTON_DEBOUNCE_MS)
     {
-        lStable = l;
-        if (lStable == LOW) { lPressed = true; lPressStartMs = millis(); }
-        else if (lPressed)  { onExtraButtonPressed(true,  (millis() - lPressStartMs) >= BUTTON_LONGPRESS_MS); lPressed = false; }
-    }
+        // LEFT edge (trigger on press -> LOW)
+        if (l != lStable)
+        {
+            lStable = l;
+            if (lStable == LOW)
+                onExtraButtonPressed(true);
+        }
 
-    // RIGHT button
-    if (r != rStable)
-    {
-        rStable = r;
-        if (rStable == LOW) { rPressed = true; rPressStartMs = millis(); }
-        else if (rPressed)  { onExtraButtonPressed(false, (millis() - rPressStartMs) >= BUTTON_LONGPRESS_MS); rPressed = false; }
+        // RIGHT edge (trigger on press -> LOW)
+        if (r != rStable)
+        {
+            rStable = r;
+            if (rStable == LOW)
+                onExtraButtonPressed(false);
+        }
     }
 }
 
@@ -528,32 +546,49 @@ void stepAntennaByButtons(int dir) // dir: +1 = CW, -1 = CCW
 
 void drawModeIndicator(bool force)
 {
-    static OperatingMode lastMode = (OperatingMode)255;
+    static OperatingMode lastMode   = (OperatingMode)255;
+    static bool          lastArmed  = false;
+    static bool          blinkOn    = true;
+    static unsigned long lastBlink  = 0;
 
-    if (!force && gMode == lastMode)
+    bool armedChanged = (presetSaveArmed != lastArmed);
+
+    // Skip redraw unless: forced, mode changed, armed (needs blink), or armed just changed
+    if (!force && gMode == lastMode && !presetSaveArmed && !armedChanged)
         return;
 
-    lastMode = gMode;
+    lastMode  = gMode;
+    lastArmed = presetSaveArmed;
 
-    const int16_t x = 10;
-    const int16_t y = tft.height() / 2;
+    // Blink oscillator (400 ms)
+    if (millis() - lastBlink >= 400) { blinkOn = !blinkOn; lastBlink = millis(); }
+
+    const int16_t x      = 10;
+    const int16_t y      = tft.height() / 2;
+    const int16_t yArmed = y - 18; // one line above Mode B
 
     tft.setTextFont(2);
     tft.setTextSize(1);
     tft.setTextDatum(TL_DATUM);
-
-    // erase both possibilities (safe after PNG redraw too)
     tft.setFreeFont(&RobotoMono_Light8pt7b);
+
+    // ── "Armed" indicator (above Mode B, blinking yellow) ────────────────
+    tft.setTextColor(TFT_BLACK, TFT_BLACK);
+    tft.drawString("Armed", x, yArmed);          // erase
+
+    if (gMode == MODE_B && presetSaveArmed && blinkOn)
+    {
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.drawString("Armed", x, yArmed);
+    }
+
+    // ── Mode label ────────────────────────────────────────────────────────
     tft.setTextColor(TFT_BLACK, TFT_BLACK);
     tft.drawString("Mode A", x, y);
     tft.drawString("Mode B", x, y);
 
-    // draw active
     tft.setTextColor(VERY_LIGHT_GREY, TFT_BLACK);
-    if (gMode == MODE_A)
-        tft.drawString("Mode A", x, y);
-    else
-        tft.drawString("Mode B", x, y);
+    tft.drawString((gMode == MODE_A) ? "Mode A" : "Mode B", x, y);
 
     tft.setTextDatum(TL_DATUM);
 }
