@@ -1071,6 +1071,10 @@ void updateEncoder()
 
     if (delta != 0)
     {
+        // Reset accumulator on direction reversal to avoid deadband
+        if ((delta > 0 && encoderAccum < 0) || (delta < 0 && encoderAccum > 0))
+            encoderAccum = 0;
+
         encoderAccum += delta;
 
         while (encoderAccum >= STEPS_PER_NOTCH || encoderAccum <= -STEPS_PER_NOTCH)
