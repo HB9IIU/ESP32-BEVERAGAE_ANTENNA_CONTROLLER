@@ -22,4 +22,6 @@ namespace HB9IIUPortal
     // State helpers
     bool isInAPMode();            // true when captive portal is running
     bool isConnected();           // true when WiFi.status() == WL_CONNECTED
+    bool isOfflineMode();         // true when user chose "Continue without WiFi"
+    void setSplashCallback(void (*cb)()); // called to redraw splash on retry
 }

@@ -1181,6 +1181,10 @@ void setup()
     // ──────────────────────────────────────────────
     // 6️⃣ Start WiFi configuration / captive portal
     // ──────────────────────────────────────────────
+    HB9IIUPortal::setSplashCallback([]() {
+        displayImageOnTFT(png, "logo.png");
+        digitalWrite(TFT_BLP, HIGH);
+    });
     HB9IIUPortal::begin("contest");
 
     // ──────────────────────────────────────────────
@@ -1229,7 +1233,33 @@ void setup()
     }
 
     // ──────────────────────────────────────────────
-    // 8️⃣ Not connected → AP mode / connecting
+    // 8️⃣ Offline mode → hardware only, no network
+    // ──────────────────────────────────────────────
+    else if (HB9IIUPortal::isOfflineMode())
+    {
+        gPanelIdStr = getStoredCallsign();
+        PANEL_ID = gPanelIdStr.c_str();
+
+        Serial.println(F("──────────────────────────────────────────────"));
+        Serial.println(F("[APP] 📴 Running in offline mode (no WiFi/MQTT)"));
+        Serial.printf("   ↳ Panel ID : %s\n", PANEL_ID);
+        Serial.println(F("──────────────────────────────────────────────\n"));
+
+        displayImageOnTFT(png, "club.png");
+        drawRemoteStationLabel();
+        displayImageOnTFT(png, "greatcircleMap.png");
+        initAntennaDial();
+        drawModeIndicator(true);
+        loadPresetsFromNVS();
+        drawKeypadNavButton(true);
+        drawTRX_SDRButton(true);
+
+        gSetupDoneMs = millis();
+        Serial.println(F("✅ Setup complete (offline).\n"));
+    }
+
+    // ──────────────────────────────────────────────
+    // 9️⃣ Not connected → AP mode / connecting
     // ──────────────────────────────────────────────
     else
     {
@@ -1307,9 +1337,9 @@ void loop()
     // ──────────────────────────────────────────────
     // 2) Connected operation
     // ──────────────────────────────────────────────
-    if (HB9IIUPortal::isConnected())
+    if (HB9IIUPortal::isConnected() || HB9IIUPortal::isOfflineMode())
     {
-        // MQTT keep-alive
+        // MQTT keep-alive (no-op when offline)
         mqttClient.loop();
 
         // ──────────────────────────────────────────────
@@ -1362,14 +1392,17 @@ void loop()
         }
 
         // ──────────────────────────────────────────
-        // WiFi RSSI indicator (idle-only)
+        // WiFi RSSI indicator (idle-only, connected only)
         // ──────────────────────────────────────────
         static long lastRssi = 0;
-        long rssi = WiFi.RSSI();
-        if (userIdle && abs(rssi - lastRssi) > 2)
+        if (userIdle && HB9IIUPortal::isConnected())
         {
-            drawWiFiIndicator();
-            lastRssi = rssi;
+            long rssi = WiFi.RSSI();
+            if (abs(rssi - lastRssi) > 2)
+            {
+                drawWiFiIndicator();
+                lastRssi = rssi;
+            }
         }
 
         // ──────────────────────────────────────────

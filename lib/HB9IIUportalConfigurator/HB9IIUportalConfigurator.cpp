@@ -28,6 +28,8 @@ namespace HB9IIUPortal
     static int scanCount = 0;
     static bool inAPmode = false;
     static bool connected = false;
+    static bool g_continueWithoutWiFi = false;
+    static void (*g_splashCb)() = nullptr;
 
     // Optional hostname for STA + mDNS
     static String g_hostname;
@@ -77,6 +79,12 @@ namespace HB9IIUPortal
             connected = true;
             Serial.println(F("[HB9IIUPortal] Using saved WiFi, no captive portal needed."));
             printNetworkInfoAndMDNS(); // IP + DNS + mDNS info
+        }
+        else if (g_continueWithoutWiFi)
+        {
+            inAPmode = false;
+            connected = false;
+            Serial.println(F("[HB9IIUPortal] Offline mode — running without WiFi."));
         }
         else
         {
@@ -187,6 +195,16 @@ namespace HB9IIUPortal
         return connected && (WiFi.status() == WL_CONNECTED);
     }
 
+    bool isOfflineMode()
+    {
+        return g_continueWithoutWiFi;
+    }
+
+    void setSplashCallback(void (*cb)())
+    {
+        g_splashCb = cb;
+    }
+
     // ───────── INTERNAL IMPLEMENTATION ─────────
 
     static bool tryToConnectSavedWiFi()
@@ -208,11 +226,9 @@ namespace HB9IIUPortal
 
         String ssid = prefs.getString("ssid", "");
         String pass = prefs.getString("pass", "");
-        // testing with wrong SSID
-        //ssid = "Kilimangaro";
         prefs.end();
 
-        // If SSID looks like "NAME (-48 dBm)" from our own scan label, strip the suffix (extra safety)
+        // Strip " (… dBm)" suffix if present (from our own scan labels)
         int parenIndex = ssid.lastIndexOf('(');
         if (parenIndex > 0 && ssid.endsWith(" dBm)"))
         {
@@ -226,100 +242,138 @@ namespace HB9IIUPortal
             return false;
         }
 
-        Serial.printf("[HB9IIUPortal] 📡 Found SSID: %s\n", ssid.c_str());
-        Serial.printf("[HB9IIUPortal] 🔐 Found Password: %s\n", pass.c_str());
+        Serial.printf("[HB9IIUPortal] Found SSID: %s\n", ssid.c_str());
 
-        Serial.printf("[HB9IIUPortal] 🔌 Connecting to WiFi: %s", ssid.c_str());
-
-        WiFi.mode(WIFI_STA);
-
-        // If a hostname was provided in begin(), apply it before connecting
-        if (g_hostname.length())
+        // Sync rotation and calibration with the already-initialised TFT in CLUB_STATION
+        tft.setRotation(1);
         {
-            WiFi.setHostname(g_hostname.c_str());
+            Preferences cal;
+            if (cal.begin("TFT", true))
+            {
+                uint16_t cd[5];
+                bool valid = true;
+                for (int i = 0; i < 5; i++)
+                {
+                    cd[i] = cal.getUInt(("calib" + String(i)).c_str(), 0xFFFF);
+                    if (cd[i] == 0xFFFF) { valid = false; break; }
+                }
+                cal.end();
+                if (valid) tft.setTouch(cd);
+            }
         }
 
-        WiFi.begin(ssid.c_str(), pass.c_str());
+        // ── Button geometry (480×320 display) ─────────────────────────────
+        const int16_t BTN_Y = 215, BTN_H = 72, BTN_R = 10;
+        const int16_t B1X = 15,  B1W = 140; // Retry         (orange)
+        const int16_t B2X = 170, B2W = 140; // Continue      (dark green)
+        const int16_t B3X = 325, B3W = 140; // Factory Reset (red)
 
-        // Wait up to ~10s
-      for (int i = 0; i < 20; ++i)
-{
+        while (true) // retry loop
+        {
+            // ── Connect attempt — splash stays, small status at bottom ─────
+            WiFi.mode(WIFI_STA);
+            if (g_hostname.length())
+                WiFi.setHostname(g_hostname.c_str());
+            WiFi.begin(ssid.c_str(), pass.c_str());
 
-if (WiFi.status() == WL_CONNECTED)
-{
-    Serial.println();
-    Serial.println("✅ [HB9IIUPortal] Connected to WiFi!");
+            tft.setTextDatum(BC_DATUM);
+            tft.setTextFont(2);
+            tft.setTextColor(TFT_YELLOW); // transparent background — over splash
+            tft.drawString("Connecting to " + ssid + " ...", 240, 316);
 
-     return true;
-}
+            Serial.printf("[HB9IIUPortal] Connecting to %s", ssid.c_str());
 
+            bool didConnect = false;
+            for (int i = 0; i < 20; i++)
+            {
+                if (WiFi.status() == WL_CONNECTED)
+                {
+                    didConnect = true;
+                    break;
+                }
+                Serial.print(".");
+                delay(300);
+            }
 
+            if (didConnect)
+            {
+                Serial.println("\n✅ [HB9IIUPortal] Connected to WiFi!");
+                return true;
+            }
 
-    // Print a dot to serial
-    Serial.print(".");
+            Serial.println("\n❌ [HB9IIUPortal] Failed to connect to saved WiFi.");
+            WiFi.disconnect(false, false);
 
-    static int dotX = 0;
-    const int textX = 130;
-    const int textY = 300;
+            // ── Failure screen with 3 buttons ─────────────────────────────
+            tft.fillScreen(TFT_BLACK);
+            tft.setTextDatum(MC_DATUM);
+            tft.setTextFont(4);
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            tft.drawString("Could not connect to", 240, 60);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.drawString(ssid, 240, 105);
+            tft.setTextFont(2);
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            tft.drawString("Touch a button to continue", 240, 155);
 
-    // Print header only once
-    if (i == 0)
-    {
-        tft.setTextFont(2);
-        tft.setTextSize(1);
-        tft.setTextColor(TFT_WHITE);
-        tft.setCursor(textX, textY);
-        tft.print("Connecting to WiFi ");
+            // Helper: draw bold text by painting twice with 1px x-offset
+            auto boldStr = [&](const String &s, int16_t cx, int16_t cy) {
+                tft.drawString(s, cx,     cy);
+                tft.drawString(s, cx + 1, cy);
+            };
 
-        // Start dots immediately after text
-        dotX = tft.getCursorX();
-    }
+            // Button 1: Retry (orange)
+            tft.fillRoundRect(B1X, BTN_Y, B1W, BTN_H, BTN_R, TFT_ORANGE);
+            tft.setTextDatum(MC_DATUM);
+            tft.setTextFont(4);
+            tft.setTextColor(TFT_BLACK, TFT_ORANGE);
+            boldStr("RETRY", B1X + B1W / 2, BTN_Y + BTN_H / 2);
 
-    // Print one new dot each iteration
-    tft.setCursor(dotX, textY);
-    tft.print(".");
-    dotX = dotX+8; // advance for next dot
+            // Button 2: Continue without WiFi (dark green)
+            tft.fillRoundRect(B2X, BTN_Y, B2W, BTN_H, BTN_R, TFT_DARKGREEN);
+            tft.setTextFont(2);
+            tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+            boldStr("CONTINUE", B2X + B2W / 2, BTN_Y + BTN_H / 2 - 9);
+            boldStr("NO WIFI",  B2X + B2W / 2, BTN_Y + BTN_H / 2 + 9);
 
-    delay(300);
-}
+            // Button 3: Factory Reset (red)
+            tft.fillRoundRect(B3X, BTN_Y, B3W, BTN_H, BTN_R, TFT_RED);
+            tft.setTextColor(TFT_WHITE, TFT_RED);
+            boldStr("FACTORY", B3X + B3W / 2, BTN_Y + BTN_H / 2 - 9);
+            boldStr("RESET",   B3X + B3W / 2, BTN_Y + BTN_H / 2 + 9);
 
-        
-        Serial.println("\n❌ [HB9IIUPortal] Failed to connect to saved WiFi.");
-        
-
-        // --- Show failed connection message on TFT ---
-
-        tft.init();
-        tft.setRotation(1);  // make sure this is your full 480x320 mode
-        tft.fillScreen(TFT_BLACK);
-        tft.setRotation(1);         // or whichever rotation gives 480×320 layout
-        tft.fillScreen(TFT_BLACK);  // confirm full clear
-        tft.setTextDatum(MC_DATUM); // center text alignment
-        tft.setTextSize(1);
-
-        // --- Line 1: Main error message (Font 4, red) ---
-        tft.setTextFont(4);
-        tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.drawString("Could not connect to", 240, 120); // centered at (x=240,y=120)
-
-        // --- Line 2: SSID (Font 4, white) ---
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.drawString(ssid, 240, 160); // center below the first line
-
-        // --- Line 3: Reboot message (Font 2, yellow) ---
-        tft.setTextFont(2);
-        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-        tft.drawString("Rebooting in 4 seconds...", 240, 210);
-
-        // --- Line 4: Factory reset hint (Font 2, white) ---
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.drawString("Press encoder switch to factory Reset", 240, 240);
-
-        // --- Wait, then reboot ---
-        delay(4000);
-        ESP.restart();
-
-        return false; // never reached
+            // ── Wait for touch ─────────────────────────────────────────────
+            uint16_t tx, ty;
+            bool retryChosen = false;
+            while (!retryChosen)
+            {
+                if (tft.getTouch(&tx, &ty))
+                {
+                    delay(50); // debounce
+                    if (ty >= BTN_Y && ty < BTN_Y + BTN_H)
+                    {
+                        if (tx >= B1X && tx < B1X + B1W)
+                        {
+                            Serial.println("[HB9IIUPortal] User: Retry");
+                            if (g_splashCb) g_splashCb();
+                            else tft.fillScreen(TFT_BLACK);
+                            retryChosen = true; // outer while loops back
+                        }
+                        else if (tx >= B2X && tx < B2X + B2W)
+                        {
+                            Serial.println("[HB9IIUPortal] User: Continue without WiFi");
+                            g_continueWithoutWiFi = true;
+                            return false;
+                        }
+                        else if (tx >= B3X && tx < B3X + B3W)
+                        {
+                            Serial.println("[HB9IIUPortal] User: Factory Reset");
+                            eraseAllPreferencesAndRestart(); // does not return
+                        }
+                    }
+                }
+            }
+        } // while(true) retry loop
     }
 
     // NEW: QR drawing helper
